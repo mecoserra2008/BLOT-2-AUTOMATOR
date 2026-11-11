@@ -146,7 +146,7 @@ try {
         if ($names -notcontains $need) { throw "Sheet $need missing in the saved workbook." }
     }
     $btn = @(); foreach ($sh in $wb.Worksheets.Item('DASHBOARD').Shapes) { if ($sh.Name -like 'btn_*') { $btn += $sh.Name } }
-    if ($btn.Count -ne 7) { throw "DASHBOARD has $($btn.Count) buttons, expected 7." }
+    if ($btn.Count -ne 8) { throw "DASHBOARD has $($btn.Count) buttons, expected 8." }
     $comps = @(); foreach ($c in $wb.VBProject.VBComponents) { $comps += $c.Name }
     foreach ($m in 'modConfig','modBlotBestEx','modSelfTest') { if ($comps -notcontains $m) { throw "Module $m missing." } }
     $ok2 = $xl.Run("'" + $wb.Name + "'!RunSelfTestsHeadless")

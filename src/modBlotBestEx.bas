@@ -6,6 +6,8 @@ Option Explicit
 '      raw-export archive, per-date history, holidays, re-entrancy guard, self-tests
 '------------------------------------------------------------------------------------------
 ' Public macros (buttons on DASHBOARD / CONFIG)
+'   RecordExport           learns EXPORT_SEQ from ONE manual export (records clicks / keys on Bloomberg)
+'   ListWindows            logs the visible window titles (to find BBG_TITLE_PREFIX)
 '   RunBlotReport          end-to-end: open BLOT -> export -> parse -> archive -> history -> alerts
 '   ValidateConfig         (modConfig) checks CONFIG, writes PASS/WARN/FAIL on CONFIG
 '   TestExport             TEST_EXPORT_RUNS cycles of OPEN_SEQ + EXPORT_SEQ + detection (no history)
@@ -53,6 +55,17 @@ Private Const MOUSE_LUP      As Long = &H4
 Private Const MOUSE_RDOWN    As Long = &H8
 Private Const MOUSE_RUP      As Long = &H10
 Private Const SW_RESTORE     As Long = 9
+Private Const SW_MAXIMIZE    As Long = 3
+Private Const GA_ROOT        As Long = 2
+Private Const VK_LBUTTON     As Long = &H1
+Private Const VK_RBUTTON     As Long = &H2
+
+Private Declare PtrSafe Function GetAsyncKeyState Lib "user32" (ByVal vKey As Long) As Integer
+Private Declare PtrSafe Function GetForegroundWindow Lib "user32" () As LongPtr
+Private Declare PtrSafe Function GetAncestor Lib "user32" (ByVal hwnd As LongPtr, ByVal gaFlags As Long) As LongPtr
+Private Declare PtrSafe Function IsZoomed Lib "user32" (ByVal hwnd As LongPtr) As Long
+Private Declare PtrSafe Function GetWindowThreadProcessId Lib "user32" (ByVal hwnd As LongPtr, lpdwProcessId As Long) As Long
+Private Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
 
 '------------------------------------ CONSTANTS ------------------------------------------
 Public Const NCOL As Long = 10            ' DEALS / HIST columns
@@ -67,6 +80,7 @@ Private gT0 As Date, gSince As Date, gDeadline As Date, gNextRun As Date, gSched
 Private gKnown As String, gCandKey As String, gCandRows As Long, gBusy As Boolean, gKind As String
 Private gPollAt As Date, gPollPending As Boolean, gCycleAt As Date, gCyclePending As Boolean
 Private gTestN As Long, gTestI As Long, gTestOK As Long, gLastErr As String, gWarned As String
+Private gRecTxtWait As Double, gRecTxtMain As Boolean, gWinChecked As Boolean
 
 '==========================================================================================
 '                                    ENTRY POINTS
@@ -263,6 +277,315 @@ EH:
 End Function
 
 '==========================================================================================
+'                                    RECORD EXPORT (learns EXPORT_SEQ from one manual export)
+'==========================================================================================
+Public Sub RecordExport()
+    Dim bb As LongPtr, bbPid As Long, fgRaw As LongPtr, root As LongPtr, rc As RECT_T, pt As POINT_T
+    Dim t0 As Double, tLast As Double, tNow As Double, tCheck As Double, tStop As Double
+    Dim toks As Collection, txt As String, prevL As Boolean, prevR As Boolean, l As Boolean, r As Boolean
+    Dim kPrev(0 To 255) As Boolean, vk As Long, kd As Boolean, inB As Boolean, isMain As Boolean
+    Dim known As String, newWb As String, stopWhy As String, seq As String, title As String, prefix As String
+    Dim lastX As Long, lastY As Long, lastT As Double, x As Long, y As Long, winInfo As String
+    Dim ans As VbMsgBoxResult, identify As Boolean
+    On Error GoTo EH
+    LoadConfig
+    If gBusy Then MsgBox "A run is in progress: click Abort first.", vbExclamation: Exit Sub
+    ans = MsgBox("RECORD EXPORT - the macro learns EXPORT_SEQ from ONE export done by hand." & vbLf & vbLf & _
+        "1. YES = first run OPEN_SEQ (BLOT 2 / BLOT -1) exactly like the daily run (recommended)." & vbLf & _
+        "2. Then do the export BY HAND in the Bloomberg panel, the way you always do it:" & vbLf & _
+        "   clicks, right-clicks, menu numbers + <GO>, Enter, Esc, until the export opens in Excel." & vbLf & _
+        "3. Recording stops by itself when the export workbook appears" & vbLf & _
+        "   (or Ctrl+Shift+Q, or after 3 minutes). Clicks outside Bloomberg are ignored." & vbLf & vbLf & _
+        "If the Bloomberg window is not recognised yet, your FIRST click on it only identifies it." & vbLf & vbLf & _
+        "Run OPEN_SEQ first?", vbYesNoCancel + vbQuestion, "Record Export")
+    If ans = vbCancel Then Exit Sub
+    If ans = vbYes Then
+        If Not RunSteps(ExpandSeq(OPEN_SEQ, Date)) Then Exit Sub
+    End If
+    known = SnapshotWorkbooks()
+    bb = BbgHwnd()
+    If bb <> 0 Then
+        GetWindowThreadProcessId bb, bbPid
+        BbgFocus
+    Else
+        identify = True
+    End If
+    Set toks = New Collection
+    For vk = 1 To 254: kPrev(vk) = KeyIsDown(vk): Next
+    prevL = kPrev(VK_LBUTTON): prevR = kPrev(VK_RBUTTON)
+    t0 = NowSec(): tLast = t0: tCheck = t0
+    Application.StatusBar = "BLOT Record Export: RECORDING - do the export in Bloomberg now (Ctrl+Shift+Q stops)"
+    WriteLog "Record Export started (Bloomberg window " & IIf(bb = 0, "not recognised yet: first click identifies it", "'" & WindowTitle(bb) & "'") & ").", LV_INFO
+    Do
+        Sleep 8
+        DoEvents
+        tNow = NowSec()
+        If tStop > 0 And tNow >= tStop Then Exit Do
+        If KeyIsDown(&H11) And KeyIsDown(&H10) And KeyIsDown(&H51) Then stopWhy = "stopped with Ctrl+Shift+Q": Exit Do
+        If tNow - t0 > 180 Then stopWhy = "3-minute limit": Exit Do
+
+        fgRaw = GetForegroundWindow(): root = GetAncestor(fgRaw, GA_ROOT)
+        inB = False: isMain = False
+        If bb <> 0 And root <> 0 Then
+            isMain = (root = bb)
+            inB = isMain Or (WindowPid(root) = bbPid And bbPid <> 0)
+        End If
+
+        l = KeyIsDown(VK_LBUTTON): r = KeyIsDown(VK_RBUTTON)
+        If ((l And Not prevL) Or (r And Not prevR)) And tStop = 0 Then
+            GetCursorPos pt
+            Sleep 40
+            fgRaw = GetForegroundWindow(): root = GetAncestor(fgRaw, GA_ROOT)
+            If identify Then
+                If root <> 0 And WindowPid(root) <> WindowPid(Application.Hwnd) Then
+                    bb = root: GetWindowThreadProcessId bb, bbPid: identify = False: tLast = tNow
+                    WriteLog "Record Export: Bloomberg window identified as '" & WindowTitle(bb) & "'.", LV_INFO
+                End If
+            ElseIf bb <> 0 And (root = bb Or (WindowPid(root) = bbPid And bbPid <> 0)) Then
+                GetWindowRect bb, rc
+                x = pt.X - rc.Left: y = pt.Y - rc.Top
+                FlushRecText toks, txt, tNow, tLast
+                If l And toks.Count > 0 And tNow - lastT < 0.45 And Abs(x - lastX) <= 4 And Abs(y - lastY) <= 4 And Left$(toks(toks.Count), 6) = "CLICK:" Then
+                    toks.Remove toks.Count
+                    toks.Add "DCLICK:" & x & "," & y
+                Else
+                    AddRecTok toks, IIf(l, "CLICK:", "RCLICK:") & x & "," & y, tNow, tLast
+                End If
+                lastX = x: lastY = y: lastT = tNow
+            End If
+        End If
+        prevL = l: prevR = r
+
+        For vk = 8 To 222
+            kd = KeyIsDown(vk)
+            If kd And Not kPrev(vk) And inB And tStop = 0 Then RecordKey toks, txt, vk, isMain, tNow, tLast
+            kPrev(vk) = kd
+        Next
+
+        If tNow - tCheck >= 1 And tStop = 0 Then
+            tCheck = tNow
+            newWb = NewWorkbookSince(known)
+            If Len(newWb) > 0 Then stopWhy = "export detected: " & newWb: tStop = tNow + 0.5
+        End If
+    Loop
+    FlushRecText toks, txt, NowSec(), tLast
+    Application.StatusBar = False
+
+    If toks.Count = 0 Then
+        Notify "Record Export: nothing was recorded on the Bloomberg window (" & stopWhy & ").", LV_WARN, True, True
+        Exit Sub
+    End If
+    seq = JoinTokens(toks) & "|WAIT:3"
+    title = WindowTitle(bb)
+    GetWindowRect bb, rc
+    winInfo = (rc.Right - rc.Left) & "x" & (rc.Bottom - rc.Top) & IIf(IsZoomed(bb) <> 0, ",MAX", "")
+    WriteLog "Record Export (" & stopWhy & "): EXPORT_SEQ = " & seq & " | window '" & title & "' " & winInfo, LV_INFO
+    ans = MsgBox("Recorded (" & stopWhy & "):" & vbLf & vbLf & seq & vbLf & vbLf & _
+                 "Bloomberg window: '" & title & "'  " & winInfo & vbLf & vbLf & _
+                 "Save it on CONFIG (replaces EXPORT_SEQ)?", vbYesNo + vbQuestion, "Record Export")
+    If ans <> vbYes Then Exit Sub
+    SetConfigValue "EXPORT_SEQ", seq
+    SetConfigValue "BBG_WINDOW", winInfo
+    If Len(title) > 0 And (Len(BBG_TITLE_PREFIX) = 0 Or UCase$(Left$(title, Len(BBG_TITLE_PREFIX))) <> UCase$(BBG_TITLE_PREFIX)) Then
+        prefix = InputBox("The Bloomberg window title is:" & vbLf & vbLf & title & vbLf & vbLf & _
+                          "Start of the title that ALWAYS identifies this panel (saved as BBG_TITLE_PREFIX):", "Record Export", SuggestPrefix(title))
+        If Len(prefix) > 0 Then SetConfigValue "BBG_TITLE_PREFIX", prefix
+    End If
+    If Len(newWb) = 0 Then
+        MsgBox "Saved. No export workbook was detected while recording - check that the last step really exported, then run Test Export.", vbExclamation, "Record Export"
+    Else
+        MsgBox "Saved. Close the export workbook '" & newWb & "', then click Test Export (it must succeed 5/5).", vbInformation, "Record Export"
+    End If
+    Exit Sub
+EH:
+    Application.StatusBar = False
+    Notify "ERROR in RecordExport: " & Err.Description, LV_ERROR, True, True
+End Sub
+
+Private Sub RecordKey(toks As Collection, ByRef txt As String, ByVal vk As Long, ByVal isMain As Boolean, ByVal tNow As Double, ByRef tLast As Double)
+    Dim ctl As Boolean, alt As Boolean, sh As Boolean, c As String, sk As String
+    Select Case vk
+        Case &H10, &H11, &H12, &H14, &H5B, &H5C, &H90, &H91, &HA0 To &HA5
+            Exit Sub                                          ' modifiers / locks
+    End Select
+    ctl = KeyIsDown(&H11): alt = KeyIsDown(&H12): sh = KeyIsDown(&H10)
+    If ctl And sh And vk = &H51 Then Exit Sub                 ' stop combination
+    c = KeyChar(vk)
+    If Len(c) > 0 And Not ctl And Not alt Then
+        If Len(txt) = 0 Then gRecTxtWait = RecWait(tNow - tLast): gRecTxtMain = isMain: tLast = tNow
+        txt = txt & c
+        Exit Sub
+    End If
+    Select Case vk
+        Case &HD                                              ' Enter = <GO>
+            If Len(txt) > 0 Then
+                If gRecTxtMain Then
+                    AddRecTokW toks, "KEYS:" & txt & "<GO>", gRecTxtWait
+                Else
+                    AddRecTokW toks, "SEND:" & EscKeys(txt) & "~", gRecTxtWait
+                End If
+                txt = "": tLast = tNow
+            Else
+                AddRecTok toks, "SEND:~", tNow, tLast
+            End If
+            Exit Sub
+        Case &H8
+            If Len(txt) > 0 Then txt = Left$(txt, Len(txt) - 1): Exit Sub
+            sk = "{BACKSPACE}"
+        Case &H1B: sk = "{ESC}"
+        Case &H9:  sk = IIf(sh, "+{TAB}", "{TAB}")
+        Case &H25: sk = "{LEFT}"
+        Case &H26: sk = "{UP}"
+        Case &H27: sk = "{RIGHT}"
+        Case &H28: sk = "{DOWN}"
+        Case &H21: sk = "{PGUP}"
+        Case &H22: sk = "{PGDN}"
+        Case &H24: sk = "{HOME}"
+        Case &H23: sk = "{END}"
+        Case &H2E: sk = "{DEL}"
+        Case &H70 To &H7B: sk = "{F" & (vk - &H6F) & "}"
+        Case Else
+            If Len(c) = 0 Then Exit Sub
+            sk = IIf(ctl, "^", "") & IIf(alt, "%", "") & LCase$(c)
+    End Select
+    FlushRecText toks, txt, tNow, tLast
+    AddRecTok toks, "SEND:" & sk, tNow, tLast
+End Sub
+
+Private Function KeyChar(ByVal vk As Long) As String
+    Select Case vk
+        Case &H30 To &H39: KeyChar = Chr$(vk)
+        Case &H60 To &H69: KeyChar = Chr$(vk - &H30)
+        Case &H41 To &H5A: KeyChar = Chr$(vk)
+        Case &H20: KeyChar = " "
+        Case &HBD, &H6D: KeyChar = "-"
+        Case &HBE, &H6E: KeyChar = "."
+        Case &HBC: KeyChar = ","
+    End Select
+End Function
+
+Private Sub FlushRecText(toks As Collection, ByRef txt As String, ByVal tNow As Double, ByRef tLast As Double)
+    If Len(txt) = 0 Then Exit Sub
+    AddRecTokW toks, "SEND:" & EscKeys(txt), gRecTxtWait
+    txt = "": tLast = tNow
+End Sub
+
+Private Sub AddRecTok(toks As Collection, ByVal tok As String, ByVal tNow As Double, ByRef tLast As Double)
+    AddRecTokW toks, tok, RecWait(tNow - tLast)
+    tLast = tNow
+End Sub
+
+Private Sub AddRecTokW(toks As Collection, ByVal tok As String, ByVal w As Double)
+    toks.Add "WAIT:" & InvariantNum(w)
+    toks.Add tok
+End Sub
+
+' Human pause -> WAIT seconds: rounded up to 0.5, between 0.5 and 8
+Public Function RecWait(ByVal dt As Double) As Double
+    Dim w As Double
+    w = -Int(-dt * 2) / 2
+    If w < 0.5 Then w = 0.5
+    If w > 8 Then w = 8
+    RecWait = w
+End Function
+
+Private Function JoinTokens(toks As Collection) As String
+    Dim t As Variant, s As String
+    For Each t In toks: s = s & "|" & t: Next
+    JoinTokens = Mid$(s, 2)
+End Function
+
+Public Function SuggestPrefix(ByVal title As String) As String
+    Dim p As Long
+    p = InStr(1, title, " - ")
+    If p > 1 Then SuggestPrefix = Left$(title, p - 1) Else SuggestPrefix = title
+End Function
+
+Private Function KeyIsDown(ByVal vk As Long) As Boolean
+    KeyIsDown = (GetAsyncKeyState(vk) And &H8000) <> 0
+End Function
+
+Private Function NowSec() As Double
+    NowSec = CDbl(Date) * 86400# + Timer
+End Function
+
+Private Function WindowPid(ByVal h As LongPtr) As Long
+    Dim pid As Long
+    If h <> 0 Then GetWindowThreadProcessId h, pid
+    WindowPid = pid
+End Function
+
+Private Function WindowTitle(ByVal h As LongPtr) As String
+    Dim s As String, l As Long
+    If h = 0 Then Exit Function
+    s = String$(260, vbNullChar): l = GetWindowText(h, s, 260)
+    If l > 0 Then WindowTitle = Left$(s, l)
+End Function
+
+Private Function NewWorkbookSince(ByVal known As String) As String
+    Dim app As Object, wb As Object
+    On Error Resume Next
+    For Each app In AllExcelApps()
+        For Each wb In app.Workbooks
+            If InStr(1, known, "|" & app.Hwnd & ":" & wb.FullName & "|", vbTextCompare) = 0 Then NewWorkbookSince = wb.Name: Exit Function
+        Next
+    Next
+End Function
+
+' Visible top-level window titles; onlyLikely = Bloomberg-looking titles only
+Public Function WindowCandidates(ByVal onlyLikely As Boolean) As String
+    Dim h As LongPtr, t As String, s As String, n As Long
+    h = FindWindowEx(0, 0, vbNullString, vbNullString)
+    Do While h <> 0 And n < 80
+        If IsWindowVisible(h) <> 0 Then
+            t = WindowTitle(h)
+            If Len(t) > 0 Then
+                If Not onlyLikely Or InStr(1, t, "bloomberg", vbTextCompare) > 0 Or InStr(1, t, "blp", vbTextCompare) > 0 Or t Like "#-*" Then
+                    s = s & "'" & t & "'; ": n = n + 1
+                End If
+            End If
+        End If
+        h = FindWindowEx(0, h, vbNullString, vbNullString)
+    Loop
+    WindowCandidates = s
+End Function
+
+Public Sub ListWindows()
+    Dim c As String
+    LoadConfig
+    c = WindowCandidates(True)
+    WriteLog "Visible windows that look like Bloomberg: " & IIf(Len(c) = 0, "(none)", c), LV_INFO
+    WriteLog "All visible windows: " & WindowCandidates(False), LV_INFO
+    If Application.Visible Then
+        MsgBox "Windows that look like Bloomberg:" & vbLf & vbLf & IIf(Len(c) = 0, "(none - see LOG for all windows)", Replace(c, "; ", vbLf)) & vbLf & vbLf & _
+               "BBG_TITLE_PREFIX must be the start of the panel title (now: '" & BBG_TITLE_PREFIX & "'). Record Export sets it for you.", vbInformation, "List Windows"
+    End If
+End Sub
+
+' Before clicks: restore the window state / size used when EXPORT_SEQ was recorded (BBG_WINDOW)
+Private Sub CheckBbgWindow(ByVal h As LongPtr)
+    Dim rc As RECT_T, cur As String, want As String
+    If h = 0 Or Len(BBG_WINDOW) = 0 Then Exit Sub
+    If InStr(1, BBG_WINDOW, "MAX", vbTextCompare) > 0 And IsZoomed(h) = 0 Then ShowWindow h, SW_MAXIMIZE: WaitSec 0.8
+    GetWindowRect h, rc
+    cur = (rc.Right - rc.Left) & "x" & (rc.Bottom - rc.Top)
+    want = Split(BBG_WINDOW, ",")(0)
+    If cur <> want Then WriteLog "Bloomberg window is " & cur & " but EXPORT_SEQ was recorded at " & want & ": clicks may miss (maximize the panel on the same monitor or re-record).", LV_WARN
+End Sub
+
+' Focus Bloomberg unless a Bloomberg window (panel, menu or dialog) is already in front
+Private Function BbgFocusUnlessOwn() As Boolean
+    Dim h As LongPtr, pid As Long
+    h = BbgHwnd(): If h = 0 Then Exit Function
+    GetWindowThreadProcessId h, pid
+    If WindowPid(GetAncestor(GetForegroundWindow(), GA_ROOT)) = pid And pid <> 0 Then
+        BbgFocusUnlessOwn = True
+    Else
+        BbgFocusUnlessOwn = BbgFocus()
+    End If
+End Function
+
+'==========================================================================================
 '                                    SETUP
 '==========================================================================================
 Public Sub Setup()
@@ -332,8 +655,8 @@ Private Function IsOwnSheet(ByVal nm As String) As Boolean
 End Function
 
 Public Function DashButtons() As Variant
-    DashButtons = Array("Run Now|RunBlotReport", "Validate Config|ValidateConfig", "Test Export|TestExport", _
-                        "Capture Click Point|CaptureClickPoint", "Import File|ImportFromFile", _
+    DashButtons = Array("Run Now|RunBlotReport", "Validate Config|ValidateConfig", "Record Export|RecordExport", _
+                        "Test Export|TestExport", "Capture Click Point|CaptureClickPoint", "Import File|ImportFromFile", _
                         "Run Self-Tests|RunSelfTests", "Abort|AbortRun")
 End Function
 
@@ -371,9 +694,10 @@ Private Sub WriteReadme()
     t.Add "e) Click 'Validate Config' and fix every FAIL line (CONFIG columns E:G)."
     t.Add ""
     t.Add "#2. Calibrate the export (TERMINAL mode)"
-    t.Add "a) Do the export once by hand in Bloomberg (BLOT 2 <GO>, BLOT -1 <GO>, export to Excel) and note how it is triggered."
-    t.Add "b) If the export item is numbered (NN) Label), set EXPORT_SEQ to e.g. KEYS:96<GO>|WAIT:1|KEYS:3<GO>."
-    t.Add "   Otherwise maximise the Bloomberg panel and use 'Capture Click Point' for every click (it appends CLICK:x,y to EXPORT_SEQ)."
+    t.Add "a) Maximise the Bloomberg panel (same monitor and size as on the run days). Close other Bloomberg popups."
+    t.Add "b) Click 'Record Export', answer Yes (it opens BLOT 2 / BLOT -1), then do the export BY HAND exactly as usual"
+    t.Add "   (clicks, right-clicks, menu numbers + <GO>, Enter). Recording stops when the export appears in Excel."
+    t.Add "   It writes EXPORT_SEQ, BBG_WINDOW and (if needed) BBG_TITLE_PREFIX on CONFIG. Close the export workbook."
     t.Add "c) Click 'Test Export': it runs TEST_EXPORT_RUNS (5) cycles. Accept EXPORT_SEQ only with 5/5 successes (see LOG)."
     t.Add "d) Check the LOG line 'Header mapping': every role must point to the right export column. Put the exact export headers first in HDR_* on CONFIG."
     t.Add "e) Pin DEALER_MODE (ROWS preferred) and set DATE_FORMAT_TEXT if the export has text dates (e.g. MM/DD/YYYY)."
@@ -759,6 +1083,9 @@ Public Function ValidateSteps(ByVal seq As String) As String
             Select Case tok
                 Case "KEYS", "SEND"
                     If Len(arg) = 0 Then ValidateSteps = "Empty " & tok & " step.": Exit Function
+                    If tok = "KEYS" And (UCase$(Trim$(arg)) Like "[A-Z]<GO>" Or InStr(1, arg, "<N>", vbTextCompare) > 0) Then
+                        ValidateSteps = "'" & s & "' looks like an unfilled placeholder: a single letter + <GO> runs a Bloomberg function (N = News). Use Record Export.": Exit Function
+                    End If
                 Case "CLICK", "RCLICK", "DCLICK"
                     xy = Split(arg, ",")
                     If UBound(xy) <> 1 Then ValidateSteps = "Bad " & s & " (expected " & tok & ":x,y).": Exit Function
@@ -776,6 +1103,7 @@ Private Function RunSteps(ByVal seq As String) As Boolean
     Dim st As Variant, s As String, tok As String, arg As String, p As Long, e As String
     e = ValidateSteps(seq)
     If Len(e) > 0 Then Notify "Step sequence rejected: " & e, LV_ERROR: Exit Function
+    gWinChecked = False
     For Each st In Split(seq, "|")
         s = Trim$(CStr(st))
         If Len(s) > 0 Then
@@ -785,10 +1113,10 @@ Private Function RunSteps(ByVal seq As String) As Boolean
                 Case "KEYS"
                     If Not BbgType(arg) Then Notify "Step failed: " & s & " (Bloomberg window '" & BBG_TITLE_PREFIX & "' not reachable).", LV_ERROR: Exit Function
                 Case "SEND"
-                    If Not BbgFocus() Then Notify "Step failed: " & s & " (Bloomberg window not found).", LV_ERROR: Exit Function
+                    If Not BbgFocusUnlessOwn() Then Notify "Step failed: " & s & " (Bloomberg window '" & BBG_TITLE_PREFIX & "' not found: use List Windows / Record Export).", LV_ERROR: Exit Function
                     SendKeys arg, True
                 Case "CLICK", "RCLICK", "DCLICK"
-                    If Not BbgClick(arg, tok) Then Notify "Step failed: " & s & " (Bloomberg window not found).", LV_ERROR: Exit Function
+                    If Not BbgClick(arg, tok) Then Notify "Step failed: " & s & " (Bloomberg window '" & BBG_TITLE_PREFIX & "' not found: use List Windows / Record Export).", LV_ERROR: Exit Function
                 Case "WAIT"
                     WaitSec Val(arg)
             End Select
@@ -823,8 +1151,10 @@ Private Function BbgClick(ByVal arg As String, ByVal kind As String) As Boolean
     Dim h As LongPtr, rc As RECT_T, xy() As String
     xy = Split(arg, ",")
     If UBound(xy) <> 1 Then Exit Function
-    If Not BbgFocus() Then Exit Function
-    h = BbgHwnd(): GetWindowRect h, rc
+    If Not BbgFocusUnlessOwn() Then Exit Function
+    h = BbgHwnd()
+    If Not gWinChecked Then CheckBbgWindow h: gWinChecked = True
+    GetWindowRect h, rc
     SetCursorPos rc.Left + CLng(Val(xy(0))), rc.Top + CLng(Val(xy(1)))
     WaitSec 0.2
     Select Case kind

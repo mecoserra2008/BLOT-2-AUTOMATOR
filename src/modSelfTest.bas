@@ -358,6 +358,12 @@ Private Sub UnitTests()
     Check "unit", "steps", "unknown token rejected", "True", B2S(Len(ValidateSteps("FOO:1")) > 0)
     Check "unit", "steps", "bad click rejected", "True", B2S(Len(ValidateSteps("CLICK:10")) > 0)
     Check "unit", "steps", "bad wait rejected", "True", B2S(Len(ValidateSteps("WAIT:x")) > 0)
+    Check "unit", "steps", "placeholder KEYS:N<GO> rejected", "True", B2S(Len(ValidateSteps("KEYS:96<GO>|WAIT:1|KEYS:N<GO>")) > 0)
+    Check "unit", "steps", "numbered menu accepted", "", ValidateSteps("KEYS:96<GO>|WAIT:1|KEYS:3<GO>|WAIT:3")
+    Check "unit", "record", "RecWait 0.2s", "0.5", InvariantNum(RecWait(0.2))
+    Check "unit", "record", "RecWait 1.2s", "1.5", InvariantNum(RecWait(1.2))
+    Check "unit", "record", "RecWait capped", "8", InvariantNum(RecWait(30))
+    Check "unit", "record", "SuggestPrefix", "1-BLOOMBERG", SuggestPrefix("1-BLOOMBERG - BLOT")
 
     '--- rules guards ---
     s = EXCL_STATUS

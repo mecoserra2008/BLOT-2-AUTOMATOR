@@ -33,7 +33,7 @@ Private Const CFG_COL_CHK  As Long = 5      ' E:G validation report
 Private Const CFG_COL_HOL  As Long = 9      ' I:J holiday table
 
 '------------------------------------ CONFIG VALUES --------------------------------------
-Public SOURCE_MODE As String, BBG_TITLE_PREFIX As String, BBG_PANEL As String
+Public SOURCE_MODE As String, BBG_TITLE_PREFIX As String, BBG_PANEL As String, BBG_WINDOW As String
 Public OPEN_SEQ As String, EXPORT_SEQ As String, STEP_GAP_S As Double
 Public EXPORT_FOLDER As String, ARCHIVE_DIR As String
 Public OUTLOOK_SUBJECT As String, OUTLOOK_FOLDER As String, CSV_DELIM As String
@@ -65,7 +65,8 @@ Private Sub BuildDefs()
     AddDef "SOURCE", "BBG_TITLE_PREFIX", "1-BLOOMBERG", "Exact start of the Bloomberg panel window title (panel 1 = '1-BLOOMBERG').", ""
     AddDef "SOURCE", "BBG_PANEL", "<blp-1>", "DDE panel prefix. Must match the title number: '1-' <-> '<blp-1>'.", ""
     AddDef "SOURCE", "OPEN_SEQ", "KEYS:BLOT 2<GO>|WAIT:3|KEYS:BLOT -1<GO>|WAIT:5", "Steps that open the BLOT view of the previous day. Tokens: KEYS:text (DDE, <GO>=GO key) | SEND:keys (SendKeys) | CLICK:x,y | RCLICK:x,y | DCLICK:x,y | WAIT:s. {DAYS_BACK} = calendar days back to the previous business day (Mon=3).", ""
-    AddDef "SOURCE", "EXPORT_SEQ", "", "Steps that export the BLOT grid. Numbered items (KEYS:96<GO>|WAIT:1|KEYS:3<GO>) or clicks recorded with 'Capture Click Point'. Accept only after Test Export succeeds 5/5.", "U"
+    AddDef "SOURCE", "EXPORT_SEQ", "", "Steps that export the BLOT grid. Fill it with the 'Record Export' button (do the export once by hand). Accept only after Test Export succeeds 5/5.", "U"
+    AddDef "SOURCE", "BBG_WINDOW", "", "Bloomberg panel size when EXPORT_SEQ was recorded (set by Record Export, e.g. 1936x1056,MAX). Clicks need the same size.", ""
     AddDef "SOURCE", "STEP_GAP_S", "0.7", "Seconds between steps.", ""
     AddDef "SOURCE", "EXPORT_FOLDER", "", "FOLDER mode: drop folder. TERMINAL mode: optional, watched too when the export is saved to a file.", "U"
     AddDef "SOURCE", "ARCHIVE_DIR", "", "Folder for the dated copy of every raw export (regulatory evidence). Required.", "U"
@@ -137,6 +138,7 @@ Public Sub ApplyConfig(ByVal d As Object)
     SOURCE_MODE = UCase$(CfgStr(d, "SOURCE_MODE"))
     BBG_TITLE_PREFIX = CfgStr(d, "BBG_TITLE_PREFIX")
     BBG_PANEL = CfgStr(d, "BBG_PANEL")
+    BBG_WINDOW = CfgStr(d, "BBG_WINDOW")
     OPEN_SEQ = CfgStr(d, "OPEN_SEQ")
     EXPORT_SEQ = CfgStr(d, "EXPORT_SEQ")
     STEP_GAP_S = CfgNum(d, "STEP_GAP_S")
@@ -333,7 +335,8 @@ Public Sub WriteConfigSheet()
     ws.Columns(9).ColumnWidth = 12: ws.Columns(10).ColumnWidth = 38
 
     WriteHolidayTable ws
-    AddSheetButtons ws, Array("Validate Config|ValidateConfig", "Run Now|RunBlotReport", "Test Export|TestExport", "Capture Click Point|CaptureClickPoint")
+    AddSheetButtons ws, Array("Validate Config|ValidateConfig", "Record Export|RecordExport", "Test Export|TestExport", _
+                              "Run Now|RunBlotReport", "List Windows|ListWindows", "Import Settings|ImportSettings")
 End Sub
 
 Private Sub WriteCfgRow(ws As Worksheet, ByVal r As Long, d As Variant)
@@ -342,6 +345,56 @@ Private Sub WriteCfgRow(ws As Worksheet, ByVal r As Long, d As Variant)
     ws.Cells(r, CFG_COL_VAL).Value = d(2)
     ws.Cells(r, CFG_COL_DESC).Value = d(3)
     If d(4) = "U" Then ws.Cells(r, CFG_COL_VAL).Interior.Color = RGB(255, 242, 204)
+End Sub
+
+' Writes one CONFIG value (as text)
+Public Sub SetConfigValue(ByVal key As String, ByVal v As String)
+    Dim ws As Worksheet, f As Range
+    Set ws = GetSheet(SH_CONFIG)
+    Set f = ws.Columns(CFG_COL_KEY).Find(What:=key, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+    If f Is Nothing Then Err.Raise vbObjectError + 2, , "Key " & key & " not found on CONFIG (run Setup)."
+    ws.Cells(f.Row, CFG_COL_VAL).NumberFormat = "@"
+    ws.Cells(f.Row, CFG_COL_VAL).Value = v
+End Sub
+
+' Copies CONFIG values, holidays and DEALER_MAP from another (older) BLOT_BestEx workbook
+Public Sub ImportSettings()
+    Dim f As Variant, wb As Workbook, src As Worksheet, v As Variant, i As Long, lr As Long, k As String, n As Long
+    Dim mine As Object, skipped As String, sm As Worksheet, dm As Worksheet
+    f = Application.GetOpenFilename("BLOT workbook (*.xlsm),*.xlsm", , "Old BLOT_BestEx workbook to copy the settings from")
+    If VarType(f) = vbBoolean Then Exit Sub
+    If StrComp(CStr(f), ThisWorkbook.FullName, vbTextCompare) = 0 Then MsgBox "Select the OLD workbook, not this one.", vbExclamation: Exit Sub
+    Set mine = NewDict()
+    For Each v In ConfigKeys(): mine(v) = 1: Next
+    Application.EnableEvents = False
+    Set wb = Workbooks.Open(CStr(f), UpdateLinks:=0, ReadOnly:=True)
+    Application.EnableEvents = True
+    On Error GoTo Done
+    Set src = wb.Worksheets(SH_CONFIG)
+    lr = src.Cells(src.Rows.Count, CFG_COL_KEY).End(xlUp).Row
+    For i = CFG_HDR_ROW + 1 To lr
+        k = UCase$(Trim$(CStr(src.Cells(i, CFG_COL_KEY).Value)))
+        If IsConfigKeyName(k) Then
+            If mine.Exists(k) Then
+                SetConfigValue k, ValToStr(src.Cells(i, CFG_COL_VAL).Value, k): n = n + 1
+            Else
+                skipped = skipped & k & " "
+            End If
+        End If
+    Next
+    v = src.Range(src.Cells(CFG_HDR_ROW + 1, CFG_COL_HOL), src.Cells(400, CFG_COL_HOL + 1)).Value
+    GetSheet(SH_CONFIG).Range(GetSheet(SH_CONFIG).Cells(CFG_HDR_ROW + 1, CFG_COL_HOL), GetSheet(SH_CONFIG).Cells(400, CFG_COL_HOL + 1)).Value = v
+    Set sm = wb.Worksheets(SH_MAP): Set dm = GetSheet(SH_MAP)
+    lr = sm.Cells(sm.Rows.Count, 1).End(xlUp).Row
+    If lr >= 2 Then
+        dm.Range("A2:B" & dm.Rows.Count).ClearContents
+        dm.Range("A2:B" & lr).NumberFormat = "@"
+        dm.Range("A2:B" & lr).Value = sm.Range("A2:B" & lr).Value
+    End If
+Done:
+    wb.Close False
+    WriteLog "Import Settings from " & f & ": " & n & " CONFIG value(s), holidays and DEALER_MAP copied." & IIf(Len(skipped) > 0, " Not copied (unknown keys): " & skipped, "") & IIf(Err.Number <> 0, " ERROR: " & Err.Description, ""), IIf(Err.Number <> 0, "ERROR", "INFO")
+    If Application.Visible Then MsgBox n & " CONFIG value(s), holidays and DEALER_MAP copied from" & vbLf & f & vbLf & vbLf & "Now click Validate Config.", vbInformation, "Import Settings"
 End Sub
 
 ' Appends a step token to a sequence key (used by CaptureClickPoint)
@@ -513,6 +566,7 @@ Public Function ValidateConfigCore(Optional ByRef nFail As Long, Optional ByRef 
     '--- enums ---
     VEnum res, "SOURCE_MODE", SOURCE_MODE, "TERMINAL|OUTLOOK|FOLDER"
     VEnum res, "GROUP_LEVEL", GROUP_LEVEL, "RFQ|ORDER"
+    If GROUP_LEVEL = "ORDER" Then VAdd res, "GROUP_LEVEL policy", "WARN", "ORDER = all RFQs of one order counted together (compliance decision; needs an order-id column in the export, see LOG 'Header mapping')."
     VEnum res, "CSV_DELIM", CSV_DELIM, "AUTO|;|,|TAB"
     If InStr(1, "|AUTO|ROWS|LIST|COUNT|", "|" & DEALER_MODE & "|") = 0 Then
         VAdd res, "DEALER_MODE", "FAIL", "'" & DEALER_MODE & "' is not AUTO|ROWS|LIST|COUNT."
@@ -542,7 +596,13 @@ Public Function ValidateConfigCore(Optional ByRef nFail As Long, Optional ByRef 
         VAdd res, "DATE_FORMAT_TEXT", "WARN", "Empty: text dates other than ISO yyyy-mm-dd fall back to the previous business day (logged). Set it if the export has text dates."
     Else
         e = ValidateDateFormat(DATE_FORMAT_TEXT)
-        If Len(e) > 0 Then VAdd res, "DATE_FORMAT_TEXT", "FAIL", e Else VAdd res, "DATE_FORMAT_TEXT", "PASS", DATE_FORMAT_TEXT
+        If Len(e) > 0 Then
+            VAdd res, "DATE_FORMAT_TEXT", "FAIL", e
+        ElseIf DATE_FORMAT_TEXT Like "*[!A-Z]*" Then
+            VAdd res, "DATE_FORMAT_TEXT", "PASS", DATE_FORMAT_TEXT
+        Else
+            VAdd res, "DATE_FORMAT_TEXT", "WARN", "'" & DATE_FORMAT_TEXT & "' has no separators: it only matches dates written like 11102026. For 11/10/2026 use MM/DD/YYYY; leave empty if the export has real date cells."
+        End If
     End If
     If Len(Trim$(Replace(HDR_DEALERS, "|", ""))) = 0 Then VAdd res, "HDR_DEALERS", "FAIL", "Empty." Else VAdd res, "HDR_DEALERS", "PASS", "First alias: '" & Split(HDR_DEALERS, "|")(0) & "'."
     If Len(Trim$(Replace(HDR_RFQ, "|", ""))) = 0 Then VAdd res, "HDR_RFQ", "WARN", "Empty: deals will be keyed by ticket or composite key." Else VAdd res, "HDR_RFQ", "PASS", "First alias: '" & Split(HDR_RFQ, "|")(0) & "'."
@@ -563,13 +623,25 @@ Public Function ValidateConfigCore(Optional ByRef nFail As Long, Optional ByRef 
             VAdd res, "EXPORT_SEQ", "FAIL", "Empty: record it with Capture Click Point or numbered items, then Test Export 5/5."
         Else
             e = ValidateSteps(EXPORT_SEQ)
-            If Len(e) > 0 Then VAdd res, "EXPORT_SEQ", "FAIL", e Else VAdd res, "EXPORT_SEQ", "PASS", "Syntax OK (confirm with Test Export 5/5)."
+            If Len(e) > 0 Then
+                VAdd res, "EXPORT_SEQ", "FAIL", e
+            ElseIf InStr(1, EXPORT_SEQ, "CLICK:", vbTextCompare) > 0 And Len(BBG_WINDOW) = 0 Then
+                VAdd res, "EXPORT_SEQ", "WARN", "Contains clicks but BBG_WINDOW is empty: record it with Record Export so the panel size is checked before clicking."
+            Else
+                VAdd res, "EXPORT_SEQ", "PASS", "Syntax OK (confirm with Test Export 5/5)."
+            End If
         End If
         e = PanelTitleMismatch(BBG_PANEL, BBG_TITLE_PREFIX)
         If Len(e) > 0 Then VAdd res, "BBG_PANEL / TITLE", "FAIL", e Else VAdd res, "BBG_PANEL / TITLE", "PASS", BBG_PANEL & " <-> " & BBG_TITLE_PREFIX
         okDde = DdeAvailable(msg)
         VAdd res, "DDE link", IIf(okDde, "PASS", "FAIL"), msg
-        If BbgHwnd() = 0 Then VAdd res, "Bloomberg window", "FAIL", "No visible window starting with '" & BBG_TITLE_PREFIX & "'. Terminal running and logged in?" Else VAdd res, "Bloomberg window", "PASS", "Found."
+        If BbgHwnd() = 0 Then
+            s = WindowCandidates(True)
+            VAdd res, "Bloomberg window", "FAIL", "No visible window title starts with '" & BBG_TITLE_PREFIX & "'. " & _
+                IIf(Len(s) > 0, "Bloomberg-like windows: " & s & "-> put the start of the right one in BBG_TITLE_PREFIX (or use Record Export).", "No Bloomberg-like window found (click List Windows).")
+        Else
+            VAdd res, "Bloomberg window", "PASS", "Found."
+        End If
     End If
 
     '--- folders ---
@@ -722,6 +794,7 @@ Private Function PanelTitleMismatch(ByVal panel As String, ByVal title As String
         PanelTitleMismatch = "BBG_PANEL '" & panel & "' is not <blp-N>.": Exit Function
     End If
     n = Mid$(panel, 6, Len(panel) - 6)
+    If Not (title Like "#-*" Or title Like "##-*") Then Exit Function      ' title without panel number: cannot check
     If Left$(title, Len(n) + 1) <> n & "-" Then
         PanelTitleMismatch = "BBG_PANEL " & panel & " expects a title starting with '" & n & "-', got '" & title & "'."
     End If
