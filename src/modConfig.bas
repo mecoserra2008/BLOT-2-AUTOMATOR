@@ -34,6 +34,7 @@ Private Const CFG_COL_HOL  As Long = 9      ' I:J holiday table
 
 '------------------------------------ CONFIG VALUES --------------------------------------
 Public SOURCE_MODE As String, BBG_TITLE_PREFIX As String, BBG_PANEL As String, BBG_WINDOW As String
+Public BBG_PROCESS As String, EXPORT_CANDIDATES As String, CALIB_WAIT_S As Long
 Public OPEN_SEQ As String, EXPORT_SEQ As String, STEP_GAP_S As Double
 Public EXPORT_FOLDER As String, ARCHIVE_DIR As String
 Public OUTLOOK_SUBJECT As String, OUTLOOK_FOLDER As String, CSV_DELIM As String
@@ -66,6 +67,9 @@ Private Sub BuildDefs()
     AddDef "SOURCE", "BBG_PANEL", "<blp-1>", "DDE panel prefix. Must match the title number: '1-' <-> '<blp-1>'.", ""
     AddDef "SOURCE", "OPEN_SEQ", "KEYS:BLOT 2<GO>|WAIT:3|KEYS:BLOT -1<GO>|WAIT:5", "Steps that open the BLOT view of the previous day. Tokens: KEYS:text (DDE, <GO>=GO key) | SEND:keys (SendKeys) | CLICK:x,y | RCLICK:x,y | DCLICK:x,y | WAIT:s. {DAYS_BACK} = calendar days back to the previous business day (Mon=3).", ""
     AddDef "SOURCE", "EXPORT_SEQ", "", "Steps that export the BLOT grid. Fill it with the 'Record Export' button (do the export once by hand). Accept only after Test Export succeeds 5/5.", "U"
+    AddDef "SOURCE", "EXPORT_CANDIDATES", "KEYS:2<GO>|WAIT:2|KEYS:2<GO>|WAIT:5 || KEYS:2<GO>|WAIT:2|SEND:{DOWN}{DOWN}~|WAIT:5 || KEYS:2<GO>|WAIT:2|SEND:{DOWN}~|WAIT:5", "Sequences tried by 'Calibrate Export' (separated by ||). Default: Export button 2<GO>, then the 2nd item 'XLS - Excel format'.", ""
+    AddDef "SOURCE", "CALIB_WAIT_S", "25", "Seconds Calibrate Export waits for the export of each candidate.", ""
+    AddDef "SOURCE", "BBG_PROCESS", "wintrv*.exe|bplus*.exe|blp*.exe|bloomberg*.exe|bbg*.exe|bterm*.exe", "Executable names of the Bloomberg Terminal, used to find its window when the title does not match BBG_TITLE_PREFIX.", ""
     AddDef "SOURCE", "BBG_WINDOW", "", "Bloomberg panel size when EXPORT_SEQ was recorded (set by Record Export, e.g. 1936x1056,MAX). Clicks need the same size.", ""
     AddDef "SOURCE", "STEP_GAP_S", "0.7", "Seconds between steps.", ""
     AddDef "SOURCE", "EXPORT_FOLDER", "", "FOLDER mode: drop folder. TERMINAL mode: optional, watched too when the export is saved to a file.", "U"
@@ -139,6 +143,9 @@ Public Sub ApplyConfig(ByVal d As Object)
     BBG_TITLE_PREFIX = CfgStr(d, "BBG_TITLE_PREFIX")
     BBG_PANEL = CfgStr(d, "BBG_PANEL")
     BBG_WINDOW = CfgStr(d, "BBG_WINDOW")
+    BBG_PROCESS = CfgStr(d, "BBG_PROCESS")
+    EXPORT_CANDIDATES = CfgStr(d, "EXPORT_CANDIDATES")
+    CALIB_WAIT_S = CLng(CfgNum(d, "CALIB_WAIT_S"))
     OPEN_SEQ = CfgStr(d, "OPEN_SEQ")
     EXPORT_SEQ = CfgStr(d, "EXPORT_SEQ")
     STEP_GAP_S = CfgNum(d, "STEP_GAP_S")
@@ -335,7 +342,7 @@ Public Sub WriteConfigSheet()
     ws.Columns(9).ColumnWidth = 12: ws.Columns(10).ColumnWidth = 38
 
     WriteHolidayTable ws
-    AddSheetButtons ws, Array("Validate Config|ValidateConfig", "Record Export|RecordExport", "Test Export|TestExport", _
+    AddSheetButtons ws, Array("Validate Config|ValidateConfig", "Calibrate Export|CalibrateExport", "Record Export|RecordExport", "Test Export|TestExport", _
                               "Run Now|RunBlotReport", "List Windows|ListWindows", "Import Settings|ImportSettings")
 End Sub
 
@@ -356,6 +363,27 @@ Public Sub SetConfigValue(ByVal key As String, ByVal v As String)
     ws.Cells(f.Row, CFG_COL_VAL).NumberFormat = "@"
     ws.Cells(f.Row, CFG_COL_VAL).Value = v
 End Sub
+
+' Applies a site file (KEY=value per line, '#' = comment) to CONFIG. Used by the build. Returns the count.
+Public Function ApplySiteConfig(ByVal path As String) As Long
+    Dim txt As String, ln As Variant, p As Long, k As String, v As String, mine As Object, kk As Variant, n As Long
+    Set mine = NewDict()
+    For Each kk In ConfigKeys(): mine(kk) = 1: Next
+    txt = Replace(Replace(ReadTextFile(path), vbCrLf, vbLf), vbCr, vbLf)
+    For Each ln In Split(txt, vbLf)
+        ln = Trim$(CStr(ln))
+        If Len(ln) > 0 And Left$(ln, 1) <> "#" Then
+            p = InStr(1, ln, "=")
+            If p > 1 Then
+                k = UCase$(Trim$(Left$(ln, p - 1))): v = Trim$(Mid$(ln, p + 1))
+                If Not mine.Exists(k) Then Err.Raise vbObjectError + 3, , "Unknown CONFIG key in site file: " & k
+                SetConfigValue k, v: n = n + 1
+            End If
+        End If
+    Next
+    WriteLog "Site configuration applied: " & n & " value(s).", "INFO"
+    ApplySiteConfig = n
+End Function
 
 ' Copies CONFIG values, holidays and DEALER_MAP from another (older) BLOT_BestEx workbook
 Public Sub ImportSettings()
@@ -656,6 +684,7 @@ Public Function ValidateConfigCore(Optional ByRef nFail As Long, Optional ByRef 
     If Len(ARCHIVE_DIR) = 0 Then
         VAdd res, "ARCHIVE_DIR", "FAIL", "Required: dated copy of every raw export (regulatory evidence)."
     Else
+        EnsureFolder ARCHIVE_DIR
         e = FolderProblem(ARCHIVE_DIR)
         If Len(e) > 0 Then VAdd res, "ARCHIVE_DIR", "FAIL", e Else VAdd res, "ARCHIVE_DIR", "PASS", ARCHIVE_DIR
     End If

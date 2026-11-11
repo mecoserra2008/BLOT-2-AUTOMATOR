@@ -6,6 +6,7 @@ Option Explicit
 '      raw-export archive, per-date history, holidays, re-entrancy guard, self-tests
 '------------------------------------------------------------------------------------------
 ' Public macros (buttons on DASHBOARD / CONFIG)
+'   CalibrateExport        tries the EXPORT_CANDIDATES one by one and keeps the one that exports
 '   RecordExport           learns EXPORT_SEQ from ONE manual export (records clicks / keys on Bloomberg)
 '   ListWindows            logs the visible window titles (to find BBG_TITLE_PREFIX)
 '   RunBlotReport          end-to-end: open BLOT -> export -> parse -> archive -> history -> alerts
@@ -66,6 +67,10 @@ Private Declare PtrSafe Function GetAncestor Lib "user32" (ByVal hwnd As LongPtr
 Private Declare PtrSafe Function IsZoomed Lib "user32" (ByVal hwnd As LongPtr) As Long
 Private Declare PtrSafe Function GetWindowThreadProcessId Lib "user32" (ByVal hwnd As LongPtr, lpdwProcessId As Long) As Long
 Private Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
+Private Declare PtrSafe Function OpenProcess Lib "kernel32" (ByVal dwDesiredAccess As Long, ByVal bInheritHandle As Long, ByVal dwProcessId As Long) As LongPtr
+Private Declare PtrSafe Function QueryFullProcessImageName Lib "kernel32" Alias "QueryFullProcessImageNameA" (ByVal hProcess As LongPtr, ByVal dwFlags As Long, ByVal lpExeName As String, lpdwSize As Long) As Long
+Private Declare PtrSafe Function CloseHandle Lib "kernel32" (ByVal hObject As LongPtr) As Long
+Private Const PROCESS_QUERY_LIMITED_INFORMATION As Long = &H1000
 
 '------------------------------------ CONSTANTS ------------------------------------------
 Public Const NCOL As Long = 10            ' DEALS / HIST columns
@@ -81,6 +86,7 @@ Private gKnown As String, gCandKey As String, gCandRows As Long, gBusy As Boolea
 Private gPollAt As Date, gPollPending As Boolean, gCycleAt As Date, gCyclePending As Boolean
 Private gTestN As Long, gTestI As Long, gTestOK As Long, gLastErr As String, gWarned As String
 Private gRecTxtWait As Double, gRecTxtMain As Boolean, gWinChecked As Boolean
+Private gCycleProc As String, gCands As Collection, gCalI As Long, gExeCache As Object
 
 '==========================================================================================
 '                                    ENTRY POINTS
@@ -277,6 +283,110 @@ EH:
 End Function
 
 '==========================================================================================
+'                                    CALIBRATE EXPORT (tries EXPORT_CANDIDATES)
+'==========================================================================================
+Public Sub CalibrateExport()
+    Dim c As Variant, lst As String, i As Long
+    On Error GoTo EH
+    LoadConfig
+    If SOURCE_MODE <> "TERMINAL" Then MsgBox "Calibrate Export is for SOURCE_MODE = TERMINAL.", vbExclamation: Exit Sub
+    Set gCands = SplitCandidates(EXPORT_CANDIDATES)
+    If gCands.Count = 0 Then MsgBox "EXPORT_CANDIDATES is empty on CONFIG.", vbExclamation: Exit Sub
+    For Each c In gCands: i = i + 1: lst = lst & i & ") " & c & vbLf: Next
+    If MsgBox("Calibrate Export tries these export sequences one after the other" & vbLf & _
+              "(each one: BLOT 2 / BLOT -1, the steps, then up to " & CALIB_WAIT_S & " s waiting for the export):" & vbLf & vbLf & lst & vbLf & _
+              "It stops at the first one that produces the export and saves it as EXPORT_SEQ." & vbLf & _
+              "Do not touch keyboard or mouse until the result message. Start?", vbOKCancel + vbQuestion, "Calibrate Export") <> vbOK Then Exit Sub
+    If Not BeginRun("CALIB") Then Exit Sub
+    gCalI = 0
+    Notify "Calibrate Export started: " & gCands.Count & " candidate(s).", LV_INFO
+    StartCalibCycle
+    Exit Sub
+EH:
+    FinishRun
+    Notify "ERROR in CalibrateExport: " & Err.Description, LV_ERROR, True, True
+End Sub
+
+Public Sub StartCalibCycle()
+    gCyclePending = False
+    If Not gBusy Or gKind <> "CALIB" Then Exit Sub
+    On Error GoTo EH
+    gCalI = gCalI + 1
+    If gCalI > gCands.Count Then
+        FinishRun
+        Notify "Calibrate Export: none of the " & gCands.Count & " candidate(s) produced an export. " & _
+               "Next: Record Export, or send the LOG (List Windows + these lines).", LV_WARN, True, True
+        Exit Sub
+    End If
+    EXPORT_SEQ = gCands(gCalI)
+    Application.StatusBar = "BLOT Calibrate Export: candidate " & gCalI & "/" & gCands.Count
+    Notify "Calibrate Export: trying " & gCalI & "/" & gCands.Count & ": " & EXPORT_SEQ, LV_INFO
+    If StartAcquisition() Then
+        gDeadline = Now + TimeSerial(0, 0, CALIB_WAIT_S)
+    Else
+        CalibCycleDone False, "steps failed (see LOG)"
+    End If
+    Exit Sub
+EH:
+    CalibCycleDone False, "error: " & Err.Description
+End Sub
+
+Private Sub CalibCycleDone(ByVal ok As Boolean, ByVal detail As String, Optional v As Variant, Optional ByVal srcFile As String = "")
+    Dim res As Object, seq As String, fld As String
+    CancelPending
+    seq = gCands(gCalI)
+    If ok Then
+        FinishRun
+        If Len(srcFile) > 0 Then fld = Left$(srcFile, InStrRev(srcFile, "\") - 1)
+        SetConfigValue "EXPORT_SEQ", seq
+        If Len(fld) > 0 Then SetConfigValue "EXPORT_FOLDER", fld
+        If Not IsMissing(v) Then
+            Set res = ParseExport(v, LoadDealerMap(), PrevBusinessDay(Date))
+            detail = detail & vbLf & "Parse: " & res("m") & " deal(s), mode=" & res("mode") & vbLf & "Header mapping: " & res("mapping")
+            If Len(res("err")) > 0 Then detail = detail & vbLf & "Parse error: " & res("err")
+        End If
+        Notify "Calibrate Export: candidate " & gCalI & " WORKS and was saved as EXPORT_SEQ = " & seq & _
+               IIf(Len(fld) > 0, " (export saved as a file in " & fld & ": saved as EXPORT_FOLDER)", "") & "." & vbLf & _
+               "Export detected: " & detail & vbLf & "Next: close the export workbook and click Test Export (must be 5/5).", LV_INFO, True, True
+        Exit Sub
+    End If
+    Notify "Calibrate Export: candidate " & gCalI & " did not export (" & detail & ").", LV_WARN, False, True
+    On Error Resume Next
+    If BbgFocusUnlessOwn() Then SendKeys "{ESC}", True                       ' close a menu left open
+    On Error GoTo 0
+    gCycleAt = Now + TimeSerial(0, 0, 3): gCycleProc = "StartCalibCycle"
+    Application.OnTime gCycleAt, ProcName(gCycleProc)
+    gCyclePending = True
+End Sub
+
+' "seq1 || seq2 || seq3"
+Public Function SplitCandidates(ByVal s As String) As Collection
+    Dim c As New Collection, a As Variant
+    For Each a In Split(s, "||")
+        If Len(Trim$(CStr(a))) > 0 Then c.Add Trim$(CStr(a))
+    Next
+    Set SplitCandidates = c
+End Function
+
+' Folders where a Bloomberg export may be saved as a file (watched during calibration only)
+Private Function CalibFolders() As Collection
+    Dim c As New Collection, f As Variant
+    For Each f In Array(Environ$("USERPROFILE") & "\Downloads", Environ$("USERPROFILE") & "\Documents", "C:\blp\data", "C:\blp\Export")
+        If Len(Dir$(CStr(f), vbDirectory)) > 0 Then c.Add CStr(f)
+    Next
+    Set CalibFolders = c
+End Function
+
+Public Sub EnsureFolder(ByVal p As String)
+    Dim fso As Object
+    On Error Resume Next
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If Not fso.FolderExists(p) Then
+        If fso.FolderExists(fso.GetParentFolderName(p)) Then fso.CreateFolder p
+    End If
+End Sub
+
+'==========================================================================================
 '                                    RECORD EXPORT (learns EXPORT_SEQ from one manual export)
 '==========================================================================================
 Public Sub RecordExport()
@@ -328,7 +438,7 @@ Public Sub RecordExport()
         inB = False: isMain = False
         If bb <> 0 And root <> 0 Then
             isMain = (root = bb)
-            inB = isMain Or (WindowPid(root) = bbPid And bbPid <> 0)
+            inB = isMain Or (WindowPid(root) = bbPid And bbPid <> 0) Or IsBloombergWindow(root)
         End If
 
         l = KeyIsDown(VK_LBUTTON): r = KeyIsDown(VK_RBUTTON)
@@ -338,10 +448,11 @@ Public Sub RecordExport()
             fgRaw = GetForegroundWindow(): root = GetAncestor(fgRaw, GA_ROOT)
             If identify Then
                 If root <> 0 And WindowPid(root) <> WindowPid(Application.Hwnd) Then
-                    bb = root: GetWindowThreadProcessId bb, bbPid: identify = False: tLast = tNow
-                    WriteLog "Record Export: Bloomberg window identified as '" & WindowTitle(bb) & "'.", LV_INFO
+                    bb = root: GetWindowThreadProcessId bb, bbPid: identify = False
+                    WriteLog "Record Export: Bloomberg window identified as '" & WindowTitle(bb) & "' [" & ProcessExe(bbPid) & "].", LV_INFO
                 End If
-            ElseIf bb <> 0 And (root = bb Or (WindowPid(root) = bbPid And bbPid <> 0)) Then
+            End If
+            If bb <> 0 And (root = bb Or (WindowPid(root) = bbPid And bbPid <> 0) Or IsBloombergWindow(root)) Then
                 GetWindowRect bb, rc
                 x = pt.X - rc.Left: y = pt.Y - rc.Top
                 FlushRecText toks, txt, tNow, tLast
@@ -540,8 +651,9 @@ Public Function WindowCandidates(ByVal onlyLikely As Boolean) As String
         If IsWindowVisible(h) <> 0 Then
             t = WindowTitle(h)
             If Len(t) > 0 Then
-                If Not onlyLikely Or InStr(1, t, "bloomberg", vbTextCompare) > 0 Or InStr(1, t, "blp", vbTextCompare) > 0 Or t Like "#-*" Then
-                    s = s & "'" & t & "'; ": n = n + 1
+                If Not onlyLikely Or InStr(1, t, "bloomberg", vbTextCompare) > 0 Or InStr(1, t, "blp", vbTextCompare) > 0 _
+                   Or t Like "#-*" Or IsBloombergWindow(h) Then
+                    s = s & "'" & t & "' [" & ProcessExe(WindowPid(h)) & "]; ": n = n + 1
                 End If
             End If
         End If
@@ -655,7 +767,7 @@ Private Function IsOwnSheet(ByVal nm As String) As Boolean
 End Function
 
 Public Function DashButtons() As Variant
-    DashButtons = Array("Run Now|RunBlotReport", "Validate Config|ValidateConfig", "Record Export|RecordExport", _
+    DashButtons = Array("Run Now|RunBlotReport", "Validate Config|ValidateConfig", "Calibrate Export|CalibrateExport", "Record Export|RecordExport", _
                         "Test Export|TestExport", "Capture Click Point|CaptureClickPoint", "Import File|ImportFromFile", _
                         "Run Self-Tests|RunSelfTests", "Abort|AbortRun")
 End Function
@@ -694,7 +806,8 @@ Private Sub WriteReadme()
     t.Add "e) Click 'Validate Config' and fix every FAIL line (CONFIG columns E:G)."
     t.Add ""
     t.Add "#2. Calibrate the export (TERMINAL mode)"
-    t.Add "a) Maximise the Bloomberg panel (same monitor and size as on the run days). Close other Bloomberg popups."
+    t.Add "a) Click 'Calibrate Export': it tries EXPORT_CANDIDATES (Export = 2<GO>, then 2nd item XLS) and saves the one that exports."
+    t.Add "   If none works: maximise the Bloomberg panel (same monitor and size as on the run days) and use Record Export below."
     t.Add "b) Click 'Record Export', answer Yes (it opens BLOT 2 / BLOT -1), then do the export BY HAND exactly as usual"
     t.Add "   (clicks, right-clicks, menu numbers + <GO>, Enter). Recording stops when the export appears in Excel."
     t.Add "   It writes EXPORT_SEQ, BBG_WINDOW and (if needed) BBG_TITLE_PREFIX on CONFIG. Close the export workbook."
@@ -804,7 +917,7 @@ End Sub
 Private Sub CancelPending()
     On Error Resume Next
     If gPollPending Then Application.OnTime gPollAt, ProcName("PollExport"), , False
-    If gCyclePending Then Application.OnTime gCycleAt, ProcName("StartTestCycle"), , False
+    If gCyclePending Then Application.OnTime gCycleAt, ProcName(gCycleProc), , False
     gPollPending = False: gCyclePending = False
 End Sub
 
@@ -848,6 +961,8 @@ Private Sub OnAcquireTimeout()
     If Len(gLastErr) > 0 Then msg = msg & " Last error: " & gLastErr
     If gKind = "TEST" Then
         TestCycleDone False, msg
+    ElseIf gKind = "CALIB" Then
+        CalibCycleDone False, "no export detected within the calibration wait"
     Else
         FinishRun
         Notify msg, LV_ALERT
@@ -857,6 +972,8 @@ End Sub
 Private Sub HandleExport(v As Variant, vRaw As Variant, ByVal label As String, ByVal srcWb As Object, ByVal srcFile As String)
     If gKind = "TEST" Then
         TestCycleDone True, label, v
+    ElseIf gKind = "CALIB" Then
+        CalibCycleDone True, label, v, srcFile
     Else
         ProcessData v, vRaw, label, srcWb, srcFile
         FinishRun
@@ -877,8 +994,8 @@ Private Sub TestCycleDone(ByVal ok As Boolean, ByVal detail As String, Optional 
     End If
     Notify "TestExport cycle " & gTestI & "/" & gTestN & ": " & IIf(ok, "OK - export detected in ", "FAIL - ") & detail, IIf(ok, LV_INFO, LV_WARN), False, True
     If gTestI < gTestN Then
-        gCycleAt = Now + TimeSerial(0, 0, 3)
-        Application.OnTime gCycleAt, ProcName("StartTestCycle")
+        gCycleAt = Now + TimeSerial(0, 0, 3): gCycleProc = "StartTestCycle"
+        Application.OnTime gCycleAt, ProcName(gCycleProc)
         gCyclePending = True
     Else
         FinishRun
@@ -895,7 +1012,15 @@ Private Function TryAcquire() As Boolean
     Select Case SOURCE_MODE
         Case "TERMINAL"
             If TryNewWorkbooks() Then TryAcquire = True: Exit Function
-            If Len(EXPORT_FOLDER) > 0 Then TryAcquire = TryFile(NewestFileSince(EXPORT_FOLDER, gSince), True)
+            If Len(EXPORT_FOLDER) > 0 Then
+                If TryFile(NewestFileSince(EXPORT_FOLDER, gSince), True) Then TryAcquire = True: Exit Function
+            End If
+            If gKind = "CALIB" Then
+                Dim fo As Variant
+                For Each fo In CalibFolders()
+                    If TryFile(NewestFileSince(CStr(fo), gSince), True) Then TryAcquire = True: Exit Function
+                Next
+            End If
         Case "FOLDER"
             TryAcquire = TryFile(NewestFileSince(EXPORT_FOLDER, gSince), True)
         Case "OUTLOOK"
@@ -1171,19 +1296,73 @@ Private Sub MouseBtn(ByVal dn As Long, ByVal up As Long)
     mouse_event up, 0, 0, 0, 0
 End Sub
 
+' Bloomberg panel window: 1) title starts with BBG_TITLE_PREFIX; 2) else the visible window of a
+' Bloomberg process (BBG_PROCESS) whose title starts with the panel number ("1-"), else the largest one
 Public Function BbgHwnd() As LongPtr
-    Dim h As LongPtr, s As String, l As Long
-    If Len(BBG_TITLE_PREFIX) = 0 Then Exit Function
+    Dim h As LongPtr, t As String, rc As RECT_T, area As Double, best As LongPtr, bestA As Double, pn As String
+    If Len(BBG_TITLE_PREFIX) > 0 Then
+        h = FindWindowEx(0, 0, vbNullString, vbNullString)
+        Do While h <> 0
+            If IsWindowVisible(h) <> 0 Then
+                t = WindowTitle(h)
+                If Len(t) > 0 Then
+                    If UCase$(Left$(t, Len(BBG_TITLE_PREFIX))) = UCase$(BBG_TITLE_PREFIX) Then BbgHwnd = h: Exit Function
+                End If
+            End If
+            h = FindWindowEx(0, h, vbNullString, vbNullString)
+        Loop
+    End If
+    If Len(BBG_PANEL) > 6 Then pn = Mid$(BBG_PANEL, 6, Len(BBG_PANEL) - 6) & "-" Else pn = "1-"
     h = FindWindowEx(0, 0, vbNullString, vbNullString)
     Do While h <> 0
         If IsWindowVisible(h) <> 0 Then
-            s = String$(260, vbNullChar): l = GetWindowText(h, s, 260)
-            If l > 0 Then
-                If UCase$(Left$(Left$(s, l), Len(BBG_TITLE_PREFIX))) = UCase$(BBG_TITLE_PREFIX) Then BbgHwnd = h: Exit Function
+            If IsBloombergWindow(h) Then
+                t = WindowTitle(h)
+                If Len(t) > 0 Then
+                    If Left$(t, Len(pn)) = pn Then BbgHwnd = h: Exit Function
+                    GetWindowRect h, rc
+                    area = CDbl(rc.Right - rc.Left) * CDbl(rc.Bottom - rc.Top)
+                    If area > bestA Then bestA = area: best = h
+                End If
             End If
         End If
         h = FindWindowEx(0, h, vbNullString, vbNullString)
     Loop
+    BbgHwnd = best
+End Function
+
+Private Function IsBloombergWindow(ByVal h As LongPtr) As Boolean
+    IsBloombergWindow = IsBloombergExe(ProcessExe(WindowPid(h)))
+End Function
+
+Public Function IsBloombergExe(ByVal exe As String) As Boolean
+    Dim a As Variant, t As String
+    If Len(exe) = 0 Then Exit Function
+    For Each a In Split(LCase$(BBG_PROCESS), "|")
+        t = Trim$(CStr(a))
+        If Len(t) > 0 Then
+            If LCase$(exe) Like t Then IsBloombergExe = True: Exit Function
+        End If
+    Next
+End Function
+
+' Executable file name of a process (lowercase), cached
+Private Function ProcessExe(ByVal pid As Long) As String
+    Dim hp As LongPtr, buf As String, n As Long, p As Long
+    If pid = 0 Then Exit Function
+    If gExeCache Is Nothing Then Set gExeCache = NewDict()
+    If gExeCache.Exists(pid) Then ProcessExe = gExeCache(pid): Exit Function
+    hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
+    If hp <> 0 Then
+        buf = String$(1024, vbNullChar): n = 1024
+        If QueryFullProcessImageName(hp, 0, buf, n) <> 0 Then
+            buf = Left$(buf, n)
+            p = InStrRev(buf, "\")
+            ProcessExe = LCase$(Mid$(buf, p + 1))
+        End If
+        CloseHandle hp
+    End If
+    gExeCache(pid) = ProcessExe
 End Function
 
 Private Function BbgFocus() As Boolean
@@ -2063,6 +2242,7 @@ Private Function ArchiveExport(ByVal srcWb As Object, ByVal srcFile As String, v
         Notify "ALERT: ARCHIVE_DIR is empty on CONFIG - the raw export was NOT archived (regulatory evidence).", LV_ALERT
         Exit Function
     End If
+    EnsureFolder ARCHIVE_DIR
     base = ARCHIVE_DIR & "\BLOT_" & Format$(td, "yyyymmdd") & "_" & Format$(Now, "yyyymmdd_hhnnss")
     On Error GoTo Fallback
     If Len(srcFile) > 0 Then

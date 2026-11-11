@@ -364,6 +364,11 @@ Private Sub UnitTests()
     Check "unit", "record", "RecWait 1.2s", "1.5", InvariantNum(RecWait(1.2))
     Check "unit", "record", "RecWait capped", "8", InvariantNum(RecWait(30))
     Check "unit", "record", "SuggestPrefix", "1-BLOOMBERG", SuggestPrefix("1-BLOOMBERG - BLOT")
+    Check "unit", "calib", "default candidates", "3", CStr(SplitCandidates(DefaultOf("EXPORT_CANDIDATES")).Count)
+    Check "unit", "calib", "candidate 1", "KEYS:2<GO>|WAIT:2|KEYS:2<GO>|WAIT:5", SplitCandidates(DefaultOf("EXPORT_CANDIDATES"))(1)
+    Check "unit", "calib", "candidates are valid steps", "", ValidateSteps(Replace(DefaultOf("EXPORT_CANDIDATES"), "||", "|"))
+    Check "unit", "calib", "Bloomberg exe wintrv.exe", "True", B2S(IsBloombergExe("wintrv.exe"))
+    Check "unit", "calib", "excel.exe is not Bloomberg", "False", B2S(IsBloombergExe("excel.exe"))
 
     '--- rules guards ---
     s = EXCL_STATUS

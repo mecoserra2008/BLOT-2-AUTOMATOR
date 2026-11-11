@@ -16,13 +16,15 @@
   If a group policy blocks it, use the manual assembly steps printed at the end.
 #>
 [CmdletBinding()]
-param([switch]$SkipReference, [switch]$KeepVbomSetting)
+param([switch]$SkipReference, [switch]$KeepVbomSetting, [string]$SiteConfig = '')
 
 $ErrorActionPreference = 'Stop'
 $root    = Split-Path $PSScriptRoot -Parent
 $srcDir  = Join-Path $root 'src'
 $distDir = Join-Path $root 'dist'
 $out     = Join-Path $distDir 'BLOT_BestEx.xlsm'
+$outSite = Join-Path $distDir 'BLOT_BestEx_SITE.xlsm'
+if (-not $SiteConfig) { $SiteConfig = Join-Path $root 'config\site.local.ini' }
 $fixDir  = Join-Path $root 'tests\fixtures'
 $vbaOut  = Join-Path $root 'tests\vba_out'
 $modules = 'modConfig.bas', 'modBlotBestEx.bas', 'modSelfTest.bas'
@@ -135,6 +137,16 @@ try {
     if (Test-Path $out) { Remove-Item $out -Force }
     $wb.Worksheets.Item('DASHBOARD').Activate()
     $wb.SaveAs($out, 52)                                  # 52 = xlOpenXMLWorkbookMacroEnabled
+
+    # site copy: same workbook with the site CONFIG values (config\site.local.ini, not in git)
+    if (Test-Path $SiteConfig) {
+        Write-Step "Applying site configuration $SiteConfig"
+        $n = $xl.Run("'" + $wb.Name + "'!ApplySiteConfig", $SiteConfig)
+        Write-Host "    $n value(s) applied"
+        if (Test-Path $outSite) { Remove-Item $outSite -Force }
+        $wb.SaveCopyAs($outSite)
+        Write-Host "    Site workbook: $outSite"
+    }
     $wb.Close($false); $wb = $null
 
     # ------------------------------------------------------------ 7. verify the saved file
@@ -146,7 +158,7 @@ try {
         if ($names -notcontains $need) { throw "Sheet $need missing in the saved workbook." }
     }
     $btn = @(); foreach ($sh in $wb.Worksheets.Item('DASHBOARD').Shapes) { if ($sh.Name -like 'btn_*') { $btn += $sh.Name } }
-    if ($btn.Count -ne 8) { throw "DASHBOARD has $($btn.Count) buttons, expected 8." }
+    if ($btn.Count -ne 9) { throw "DASHBOARD has $($btn.Count) buttons, expected 9." }
     $comps = @(); foreach ($c in $wb.VBProject.VBComponents) { $comps += $c.Name }
     foreach ($m in 'modConfig','modBlotBestEx','modSelfTest') { if ($comps -notcontains $m) { throw "Module $m missing." } }
     $ok2 = $xl.Run("'" + $wb.Name + "'!RunSelfTestsHeadless")

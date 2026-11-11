@@ -5,3 +5,6 @@ tests/vba_out/
 # original handoff copies (working copies: CLAUDE.md, src/modBlotBestEx.bas)
 CLAUDE (1).md
 modBlotBestEx (1).bas
+# site-specific configuration (paths) and the configured workbook built from it
+config/*.local.ini
+dist/*_SITE.xlsm
