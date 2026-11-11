@@ -1,0 +1,9 @@
+Inquiry ID,Trade Date,ISIN,Side,Quantity,Dealer,Status
+RFQ-101,2026-11-10,XS0000000101,Buy,1000000,,Done
+,,,,,JPM,Done
+,,,,,BNPP,Expired
+,,,,,SG,Passed
+,,,,,CITI,Expired
+RFQ-102,2026-11-10,XS0000000102,Sell,250000,,Done
+,,,,,BARC,Done
+,,,,,HSBC,Passed

@@ -1,0 +1,44 @@
+{
+  "fixture": "f5_composite.csv",
+  "default_trade_date": "2026-11-10",
+  "dealer_map": {
+    "JPM": "JPMORGAN",
+    "JPM LDN": "JPMORGAN",
+    "JPMS": "JPMORGAN"
+  },
+  "cases": [
+    {
+      "name": "default",
+      "config": {},
+      "expect": {
+        "mode": "ROWS",
+        "n_trades": 3,
+        "n_below": 1,
+        "n_key_issue": 0,
+        "deals": [
+          {
+            "key": "CMP:2026-11-10|XS0000000501|BUY|1000000|09:00:00|TRADER A",
+            "date": "2026-11-10",
+            "n": 3,
+            "status": "OK",
+            "dealers": "BNPP;JPMORGAN;SG"
+          },
+          {
+            "key": "CMP:2026-11-10|XS0000000501|BUY|1000000|11:30:00|TRADER A",
+            "date": "2026-11-10",
+            "n": 2,
+            "status": "< 3",
+            "dealers": "CITI;JPMORGAN"
+          },
+          {
+            "key": "CMP:2026-11-10|XS0000000501|BUY|1000000|11:30:00|TRADER B",
+            "date": "2026-11-10",
+            "n": 4,
+            "status": "OK",
+            "dealers": "BARC;DB;HSBC;UBS"
+          }
+        ]
+      }
+    }
+  ]
+}

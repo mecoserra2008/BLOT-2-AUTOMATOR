@@ -1,0 +1,45 @@
+{
+  "fixture": "f3_count.csv",
+  "default_trade_date": "2026-11-10",
+  "dealer_map": {
+    "JPM": "JPMORGAN",
+    "JPM LDN": "JPMORGAN",
+    "JPMS": "JPMORGAN"
+  },
+  "cases": [
+    {
+      "name": "default",
+      "config": {},
+      "expect": {
+        "mode": "COUNT",
+        "n_trades": 3,
+        "n_below": 1,
+        "n_key_issue": 0,
+        "n_dropped": 0,
+        "deals": [
+          {
+            "key": "TKT:T-201",
+            "date": "2026-11-10",
+            "n": 5,
+            "status": "OK",
+            "dealers": ""
+          },
+          {
+            "key": "TKT:T-202",
+            "date": "2026-11-10",
+            "n": 2,
+            "status": "< 3",
+            "dealers": ""
+          },
+          {
+            "key": "TKT:T-203",
+            "date": "2026-11-10",
+            "n": 3,
+            "status": "OK",
+            "dealers": ""
+          }
+        ]
+      }
+    }
+  ]
+}

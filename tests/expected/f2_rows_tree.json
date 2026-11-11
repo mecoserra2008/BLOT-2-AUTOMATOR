@@ -1,0 +1,40 @@
+{
+  "fixture": "f2_rows_tree.csv",
+  "default_trade_date": "2026-11-10",
+  "dealer_map": {
+    "JPM": "JPMORGAN",
+    "JPM LDN": "JPMORGAN",
+    "JPMS": "JPMORGAN"
+  },
+  "cases": [
+    {
+      "name": "default",
+      "config": {},
+      "expect": {
+        "mode": "ROWS",
+        "n_trades": 2,
+        "n_below": 1,
+        "n_key_issue": 0,
+        "n_dropped": 0,
+        "deals": [
+          {
+            "key": "RFQ:RFQ-101",
+            "date": "2026-11-10",
+            "n": 4,
+            "status": "OK",
+            "dealers": "BNPP;CITI;JPMORGAN;SG",
+            "security": "XS0000000101"
+          },
+          {
+            "key": "RFQ:RFQ-102",
+            "date": "2026-11-10",
+            "n": 2,
+            "status": "< 3",
+            "dealers": "BARC;HSBC",
+            "security": "XS0000000102"
+          }
+        ]
+      }
+    }
+  ]
+}
