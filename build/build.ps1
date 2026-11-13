@@ -154,11 +154,11 @@ try {
     $xl.EnableEvents = $false                             # do not arm the scheduler here
     $wb = $xl.Workbooks.Open($out, 0, $true)
     $names = @(); foreach ($s in $wb.Worksheets) { $names += $s.Name }
-    foreach ($need in 'README','DASHBOARD','CONFIG','DEALER_MAP','DEALS','HIST','HIST_DAILY','RAW','LOG','TESTS','FIXTURES') {
+    foreach ($need in 'DASHBOARD','INQUIRIES','QUOTES','PASTE','HIST','HIST_DAILY','CONFIG','DEALER_MAP','LOG','TESTS','FIXTURES') {
         if ($names -notcontains $need) { throw "Sheet $need missing in the saved workbook." }
     }
     $btn = @(); foreach ($sh in $wb.Worksheets.Item('DASHBOARD').Shapes) { if ($sh.Name -like 'btn_*') { $btn += $sh.Name } }
-    if ($btn.Count -ne 9) { throw "DASHBOARD has $($btn.Count) buttons, expected 9." }
+    if ($btn.Count -ne 6) { throw "DASHBOARD has $($btn.Count) buttons, expected 6." }
     $comps = @(); foreach ($c in $wb.VBProject.VBComponents) { $comps += $c.Name }
     foreach ($m in 'modConfig','modBlotBestEx','modSelfTest') { if ($comps -notcontains $m) { throw "Module $m missing." } }
     $ok2 = $xl.Run("'" + $wb.Name + "'!RunSelfTestsHeadless")

@@ -1,0 +1,86 @@
+{
+  "fixture": "b1_blot_basic.csv",
+  "default_trade_date": "2026-11-12",
+  "dealer_map": {
+    "BNP PARIB.": "BNP PARIBAS"
+  },
+  "cases": [
+    {
+      "name": "default",
+      "config": {},
+      "expect": {
+        "n_units": 5,
+        "n_requests": 5,
+        "n_legs": 14,
+        "n_filled": 2,
+        "n_breach": 1,
+        "n_low": 1,
+        "n_key": 0,
+        "n_quoted_low": 4,
+        "first_check": "BREACH",
+        "units": [
+          {
+            "key": "INQ:FITDNA:AAAA00000000A0",
+            "date": "2026-11-12",
+            "requests": 1,
+            "asked": 3,
+            "quoted": 0,
+            "filled": "NO",
+            "winner": "",
+            "check": "OK"
+          },
+          {
+            "key": "INQ:FITDNA:BBBB00000000B0",
+            "date": "2026-11-12",
+            "requests": 1,
+            "asked": 4,
+            "quoted": 1,
+            "filled": "NO",
+            "winner": "",
+            "check": "OK"
+          },
+          {
+            "key": "INQ:FITDNA:CCCC00000000C0",
+            "date": "2026-11-12",
+            "requests": 1,
+            "asked": 3,
+            "quoted": 3,
+            "filled": "YES",
+            "winner": "DEALER ONE",
+            "check": "OK"
+          },
+          {
+            "key": "INQ:FITDNA:DDDD00000000D0",
+            "date": "2026-11-12",
+            "requests": 1,
+            "asked": 2,
+            "quoted": 2,
+            "filled": "YES",
+            "winner": "DEALER FIVE",
+            "check": "BREACH"
+          },
+          {
+            "key": "INQ:FITDNA:EEEE00000000E0",
+            "date": "2026-11-12",
+            "requests": 1,
+            "asked": 2,
+            "quoted": 0,
+            "filled": "NO",
+            "winner": "",
+            "check": "LOW"
+          }
+        ]
+      }
+    },
+    {
+      "name": "suffix_zero",
+      "config": {
+        "ID_SUFFIX_LEN": 0
+      },
+      "expect": {
+        "n_units": 14,
+        "warning_contains": "ID_SUFFIX_LEN"
+      }
+    }
+  ]
+}

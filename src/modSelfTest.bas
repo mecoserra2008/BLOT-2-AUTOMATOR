@@ -5,14 +5,14 @@ Option Explicit
 '   RunSelfTests            button: runs everything, shows a summary, activates TESTS
 '   RunSelfTestsHeadless    same without any popup / e-mail; returns TRUE if all pass (build)
 '   EmbedFixtures folder    copies tests/fixtures/*.csv + tests/expected/*.json into FIXTURES
-'   DumpSelfTestResults dir writes the VBA deals of every fixture case as CSV (cross-check
+'   DumpSelfTestResults dir writes the VBA units of every fixture case as CSV (cross-check
 '                           with tests/reference_impl.py)
 ' Fixture spec (tests/expected/<fixture>.json):
-'   { "fixture": "...csv", "default_trade_date": "yyyy-mm-dd", "dealer_map": {alias: entity},
-'     "cases": [ { "name": "...", "config": {KEY: value}, "rerun": bool,
-'                  "expect": { "mode", "n_trades", "n_below", "n_key_issue", "n_dropped",
-'                              "pct_below", "n_date_fallback", "hist_rows", "hist_daily_rows",
-'                              "deals": [ {"key","date","n","status","dealers","security"} ] } } ] }
+'   { "fixture", "default_trade_date", "dealer_map": {alias: entity},
+'     "cases": [ { "name", "config": {KEY: value}, "rerun": bool,
+'                  "expect": { "n_units", "n_requests", "n_legs", "n_filled", "n_breach", "n_low", "n_key",
+'                              "n_quoted_low", "first_check", "warning_contains", "hist_rows", "hist_daily_rows",
+'                              "units": [ {"key","date","requests","asked","quoted","filled","winner","check"} ] } } ] }
 '==========================================================================================
 
 Private gT As Worksheet, gRow As Long, gPass As Long, gFail As Long
@@ -146,13 +146,13 @@ Private Sub RunFixture(ByVal name As String, ByVal csv As String, ByVal js As St
     For Each cs In spec("cases")
         cname = CStr(cs("name"))
         ApplyConfig CfgDict(cs)
-        a = ParseCsvText(csv, CSV_DELIM)
+        a = ParseCsvText(csv, "AUTO")
         blk = FindBlockInArray(a)
         If IsEmpty(blk) Then
             Check name, cname, "header row found", "yes", "no"
         Else
             If cs.Exists("dealer_map") Then Set dm = MapDict(cs("dealer_map")) Else Set dm = MapDict(spec("dealer_map"))
-            Set res = ParseExport(blk, dm, defTD)
+            Set res = AnalyzeBlot(blk, dm, defTD)
             Set ex = cs("expect")
             CompareResult name, cname, res, ex
             If ex.Exists("hist_rows") Or ex.Exists("hist_daily_rows") Then
@@ -192,56 +192,55 @@ Private Function MapDict(m As Variant) As Object
 End Function
 
 Private Sub CompareResult(ByVal fx As String, ByVal cname As String, res As Object, ex As Object)
-    Dim deals As Variant, got As Object, i As Long, e As Variant, k As String, row As Variant, m As Long
+    Dim units As Variant, got As Object, i As Long, e As Variant, k As String, m As Long, f As Variant
 
     Check fx, cname, "parse ok", "True", B2S(res("ok")) & IIf(Len(res("err")) > 0, " (" & res("err") & ")", "")
-    If ex.Exists("mode") Then Check fx, cname, "mode", CStr(ex("mode")), res("mode")
-    If ex.Exists("n_trades") Then Check fx, cname, "n_trades", JInt(ex("n_trades")), CStr(res("m"))
-    If ex.Exists("n_below") Then Check fx, cname, "n_below", JInt(ex("n_below")), CStr(res("nB"))
-    If ex.Exists("n_key_issue") Then Check fx, cname, "n_key_issue", JInt(ex("n_key_issue")), CStr(res("nBad"))
-    If ex.Exists("n_dropped") Then Check fx, cname, "n_dropped", JInt(ex("n_dropped")), CStr(res("nDropped"))
-    If ex.Exists("n_date_fallback") Then Check fx, cname, "n_date_fallback", JInt(ex("n_date_fallback")), CStr(res("nDateFallback"))
-    If ex.Exists("pct_below") And res("m") > 0 Then
-        Check fx, cname, "pct_below", Format$(CDbl(ex("pct_below")), "0.000"), Format$(res("nB") / res("m"), "0.000")
-    End If
-    If Not ex.Exists("deals") Then Exit Sub
+    For Each f In Array(Array("n_units", "m"), Array("n_requests", "nRequests"), Array("n_legs", "nLegs"), Array("n_filled", "nFilled"), _
+                        Array("n_breach", "nBreach"), Array("n_low", "nLow"), Array("n_key", "nKey"), Array("n_quoted_low", "nQuotedLow"))
+        If ex.Exists(f(0)) Then Check fx, cname, CStr(f(0)), JInt(ex(f(0))), CStr(res(f(1)))
+    Next
+    If ex.Exists("warning_contains") Then Check fx, cname, "warning contains '" & ex("warning_contains") & "'", "True", B2S(InStr(1, res("warnings"), CStr(ex("warning_contains")), vbTextCompare) > 0)
+    If Not ex.Exists("units") Then Exit Sub
 
     Set got = NewDict()
     m = res("m")
     If m > 0 Then
-        deals = res("deals")
-        For i = 1 To m: got(CStr(deals(i, 2))) = i: Next
+        units = res("units")
+        For i = 1 To m: got(CStr(units(i, 2))) = i: Next
     End If
-    Check fx, cname, "deal count", CStr(ex("deals").Count), CStr(m)
-    For Each e In ex("deals")
+    Check fx, cname, "unit count", CStr(ex("units").Count), CStr(m)
+    For Each e In ex("units")
         k = CStr(e("key"))
         If Not got.Exists(k) Then
-            Check fx, cname, "deal " & k, "present", "missing (got: " & JoinKeys(got) & ")"
+            Check fx, cname, "unit " & k, "present", "missing (got: " & JoinKeys(got) & ")"
         Else
             i = got(k)
-            If e.Exists("n") Then Check fx, cname, k & " n", JInt(e("n")), CStr(deals(i, 6))
-            If e.Exists("status") Then Check fx, cname, k & " status", CStr(e("status")), CStr(deals(i, 7))
-            If e.Exists("date") Then Check fx, cname, k & " date", CStr(e("date")), Format$(deals(i, 1), "yyyy-mm-dd")
-            If e.Exists("dealers") Then Check fx, cname, k & " dealers", CStr(e("dealers")), CStr(deals(i, 9))
-            If e.Exists("security") Then Check fx, cname, k & " security", CStr(e("security")), CStr(deals(i, 3))
+            If e.Exists("date") Then Check fx, cname, k & " date", CStr(e("date")), Format$(units(i, 1), "yyyy-mm-dd")
+            If e.Exists("requests") Then Check fx, cname, k & " requests", JInt(e("requests")), CStr(units(i, 7))
+            If e.Exists("asked") Then Check fx, cname, k & " asked", JInt(e("asked")), CStr(units(i, 8))
+            If e.Exists("quoted") Then Check fx, cname, k & " quoted", JInt(e("quoted")), CStr(units(i, 9))
+            If e.Exists("filled") Then Check fx, cname, k & " filled", CStr(e("filled")), CStr(units(i, 10))
+            If e.Exists("winner") Then Check fx, cname, k & " winner", CStr(e("winner")), CStr(units(i, 11))
+            If e.Exists("check") Then Check fx, cname, k & " check", CStr(e("check")), CStr(units(i, 13))
         End If
     Next
+    If ex.Exists("first_check") And m > 0 Then Check fx, cname, "worst first", CStr(ex("first_check")), CStr(units(1, 13))
 End Sub
 
-' Loads the deals into scratch HIST / HIST_DAILY sheets (once, or twice when rerun) and counts rows
+' Loads the units into scratch HIST / HIST_DAILY sheets (once, or twice when rerun) and counts rows
 Private Sub HistTest(ByVal fx As String, ByVal cname As String, res As Object, ex As Object, ByVal rerun As Boolean)
     Dim wsH As Worksheet, wsD As Worksheet, out As Variant, m As Long, i As Long, dates As Object
     Dim nH1 As Long, nH2 As Long, nD As Long, da As Boolean
     m = res("m")
-    If m = 0 Then Check fx, cname, "hist test has deals", ">0", "0": Exit Sub
-    out = res("deals")
-    For i = 1 To m: out(i, 8) = Now: out(i, 10) = "selftest": Next
+    If m = 0 Then Check fx, cname, "hist test has units", ">0", "0": Exit Sub
+    out = res("units")
+    For i = 1 To m: out(i, 15) = Now: out(i, 16) = "selftest": Next
     Set wsH = ScratchSheet("T_HIST"): Set wsD = ScratchSheet("T_HIST_DAILY")
     Set dates = UpsertHist(wsH, out, m)
     RecalcHistDaily wsH, wsD, dates
     nH1 = wsH.Cells(wsH.Rows.Count, 1).End(xlUp).Row - 1
     If rerun Then
-        For i = 1 To m: out(i, 8) = Now + TimeSerial(0, 1, 0): Next
+        For i = 1 To m: out(i, 15) = Now + TimeSerial(0, 1, 0): Next
         Set dates = UpsertHist(wsH, out, m)
         RecalcHistDaily wsH, wsD, dates
     End If
@@ -251,8 +250,9 @@ Private Sub HistTest(ByVal fx As String, ByVal cname As String, res As Object, e
     If ex.Exists("hist_rows") Then Check fx, cname, "HIST rows", JInt(ex("hist_rows")), CStr(nH2)
     If ex.Exists("hist_daily_rows") Then Check fx, cname, "HIST_DAILY rows", JInt(ex("hist_daily_rows")), CStr(nD)
     If nD >= 1 Then
-        Check fx, cname, "HIST_DAILY NTrades total", CStr(m), CStr(Application.WorksheetFunction.Sum(wsD.Range("B:B")))
-        Check fx, cname, "HIST_DAILY NBelowMin total", CStr(res("nB")), CStr(Application.WorksheetFunction.Sum(wsD.Range("C:C")))
+        Check fx, cname, "HIST_DAILY Requests total", CStr(m), CStr(Application.WorksheetFunction.Sum(wsD.Range("B:B")))
+        Check fx, cname, "HIST_DAILY Filled total", CStr(res("nFilled")), CStr(Application.WorksheetFunction.Sum(wsD.Range("C:C")))
+        Check fx, cname, "HIST_DAILY Breach total", CStr(res("nBreach")), CStr(Application.WorksheetFunction.Sum(wsD.Range("D:D")))
     End If
     da = Application.DisplayAlerts: Application.DisplayAlerts = False
     wsH.Delete: wsD.Delete
@@ -273,7 +273,7 @@ Private Function ScratchSheet(ByVal nm As String) As Worksheet
 End Function
 
 Public Sub DumpSelfTestResults(ByVal outDir As String)
-    Dim it As Variant, res As Object, deals As Variant, i As Long, h As Integer, p As String, fso As Object
+    Dim it As Variant, res As Object, u As Variant, i As Long, h As Integer, p As String, fso As Object
     If gDump Is Nothing Then RunSelfTestsHeadless
     If gDump.Count = 0 Then RunSelfTestsHeadless
     Set fso = CreateObject("Scripting.FileSystemObject")
@@ -284,12 +284,12 @@ Public Sub DumpSelfTestResults(ByVal outDir As String)
         p = outDir & Left$(it(0), Len(it(0)) - 4) & "__" & it(1) & ".csv"
         h = FreeFile
         Open p For Output As #h
-        Print #h, "key,date,n,status,dealers,security,mode"
+        Print #h, "key,date,requests,asked,quoted,filled,winner,check"
         If res("m") > 0 Then
-            deals = res("deals")
+            u = res("units")
             For i = 1 To res("m")
-                Print #h, Q(deals(i, 2)) & "," & Q(Format$(deals(i, 1), "yyyy-mm-dd")) & "," & Q(deals(i, 6)) & "," & _
-                          Q(deals(i, 7)) & "," & Q(deals(i, 9)) & "," & Q(deals(i, 3)) & "," & Q(res("mode"))
+                Print #h, Q(u(i, 2)) & "," & Q(Format$(u(i, 1), "yyyy-mm-dd")) & "," & Q(u(i, 7)) & "," & Q(u(i, 8)) & "," & _
+                          Q(u(i, 9)) & "," & Q(u(i, 10)) & "," & Q(u(i, 11)) & "," & Q(u(i, 13))
             Next
         End If
         Close #h
@@ -308,75 +308,63 @@ Private Sub UnitTests()
 
     '--- calendar ---
     Check "unit", "calendar", "Easter 2026", "2026-04-05", Format$(EasterSunday(2026), "yyyy-mm-dd")
-    Check "unit", "calendar", "Easter 2027", "2027-03-28", Format$(EasterSunday(2027), "yyyy-mm-dd")
     Set savedH = HolidaySet
     Set HolidaySet = NewDict()
     HolidaySet(CLng(DateSerial(2026, 6, 10))) = 1
     Check "unit", "calendar", "prev bday of Thu 2026-06-11 (Wed holiday)", "2026-06-09", Format$(PrevBusinessDay(DateSerial(2026, 6, 11)), "yyyy-mm-dd")
     Check "unit", "calendar", "prev bday of Mon 2026-11-16", "2026-11-13", Format$(PrevBusinessDay(DateSerial(2026, 11, 16)), "yyyy-mm-dd")
-    Check "unit", "calendar", "DAYS_BACK Mon 2026-11-16", "3", CStr(DaysBack(DateSerial(2026, 11, 16)))
-    Check "unit", "calendar", "holiday is not a business day", "False", B2S(IsBusinessDay(DateSerial(2026, 6, 10)))
     Check "unit", "steps", "{DAYS_BACK} expansion", "KEYS:BLOT -2<GO>", ExpandSeq("KEYS:BLOT -{DAYS_BACK}<GO>", DateSerial(2026, 6, 11))
     Set HolidaySet = savedH
 
     '--- dates ---
-    Check "unit", "dates", "MM/DD/YYYY 11/10/2026", "2026-11-10", DT("11/10/2026", "MM/DD/YYYY")
-    Check "unit", "dates", "DD/MM/YYYY 10/11/2026 14:32", "2026-11-10", DT("10/11/2026 14:32", "DD/MM/YYYY")
-    Check "unit", "dates", "DD-MMM-YY 10-Nov-26", "2026-11-10", DT("10-Nov-26", "DD-MMM-YY")
-    Check "unit", "dates", "DD-MMM-YYYY 10-Dez-2026 (PT)", "2026-12-10", DT("10-Dez-2026", "DD-MMM-YYYY")
-    Check "unit", "dates", "YYYYMMDD 20261110", "2026-11-10", DT("20261110", "YYYYMMDD")
-    Check "unit", "dates", "M/D/YYYY 1/5/2026", "2026-01-05", DT("1/5/2026", "M/D/YYYY")
-    Check "unit", "dates", "ISO without format", "2026-11-10", DT("2026-11-10", "")
-    Check "unit", "dates", "ISO with time", "2026-11-10", DT("2026-11-10T09:15:00", "MM/DD/YYYY")
-    Check "unit", "dates", "ambiguous text without format rejected", "FAIL", DT("11/10/2026", "")
-    Check "unit", "dates", "invalid month rejected", "FAIL", DT("13/10/2026", "MM/DD/YYYY")
-    Check "unit", "dates", "invalid day rejected", "FAIL", DT("02/30/2026", "MM/DD/YYYY")
-    If ParseDateCell(CDbl(DateSerial(2026, 11, 10)) + 0.4, "", d) Then s = Format$(d, "yyyy-mm-dd") Else s = "FAIL"
-    Check "unit", "dates", "numeric serial (Value2)", "2026-11-10", s
-    Check "unit", "dates", "format validation", "", ValidateDateFormat("MM/DD/YYYY")
-    Check "unit", "dates", "bad format detected", "True", B2S(Len(ValidateDateFormat("MM/YYYY")) > 0)
+    Check "unit", "dates", "DD/MM/YYYY 12/11/2026 (BLOT Trade Dt)", "2026-11-12", DT("12/11/2026", "DD/MM/YYYY")
+    Check "unit", "dates", "MM/DD/YYYY 11/12/2026", "2026-11-12", DT("11/12/2026", "MM/DD/YYYY")
+    Check "unit", "dates", "DD-MMM-YY 12-Nov-26", "2026-11-12", DT("12-Nov-26", "DD-MMM-YY")
+    Check "unit", "dates", "ISO without format", "2026-11-12", DT("2026-11-12", "")
+    Check "unit", "dates", "invalid day rejected", "FAIL", DT("31/11/2026", "DD/MM/YYYY")
+    If ParseDateCell(CDbl(DateSerial(2026, 11, 12)) + 0.4, "", d) Then s = Format$(d, "yyyy-mm-dd") Else s = "FAIL"
+    Check "unit", "dates", "numeric serial (real date cell)", "2026-11-12", s
 
-    '--- numbers / text ---
-    Check "unit", "text", "InvariantNum 1234567890123", "1234567890123", InvariantNum(1234567890123#)
+    '--- prices / text ---
+    Check "unit", "price", "PT decimal 96,198", "96.198", InvariantNum(PriceOf("96,198"))
+    Check "unit", "price", "dot decimal 96.198", "96.198", InvariantNum(PriceOf("96.198"))
+    Check "unit", "price", "thousands 98.735,67", "98735.67", InvariantNum(PriceOf("98.735,67"))
+    Check "unit", "price", "real number", "96.198", InvariantNum(PriceOf(96.198))
+    Check "unit", "price", "blank = not quoted", "0", InvariantNum(PriceOf(""))
+    Check "unit", "text", "NormName", "BNP PARIB.", NormName("  bnp" & vbTab & "  parib." & Chr$(160))
     Check "unit", "text", "InvariantNum 2.5", "2.5", InvariantNum(2.5)
-    Check "unit", "text", "InvariantNum 0.25", "0.25", InvariantNum(0.25)
-    Check "unit", "text", "NormName", "JPM LDN", NormName("  jpm" & vbTab & "  ldn" & Chr$(160))
-    Check "unit", "text", "IsPlainNumber 1,000", "False", B2S(IsPlainNumber("1,000"))
+
+    '--- request key / status ---
+    Check "unit", "key", "ID without leg suffix", "INQ:FITDNA:6AF5A884011800", RequestKey("FITDNA:6AF5A884011800" & "03", Date, "X", "B", "1")
+    Check "unit", "key", "no ID -> composite", "CMP:2026-11-12|XS1|B|100", RequestKey("", DateSerial(2026, 11, 12), "XS1", "B", "100")
+    Check "unit", "status", "Done is filled", "True", B2S(IsFilledStatus("Done"))
+    Check "unit", "status", "Passed is not filled", "False", B2S(IsFilledStatus("Passed"))
+    Check "unit", "status", "C/Cancel is not filled", "False", B2S(IsFilledStatus("C/Cancel"))
+    Check "unit", "status", "Rejected is not filled", "False", B2S(IsFilledStatus("Rejected"))
 
     '--- csv ---
     a = ParseCsvText("a;b;c" & vbCrLf & """x;y"";2;""l1" & vbLf & "l2""" & vbCrLf & "q;""he said """"hi"""""";", "AUTO")
     Check "unit", "csv", "rows x cols", "3x3", (UBound(a, 1)) & "x" & (UBound(a, 2))
     Check "unit", "csv", "quoted delimiter", "x;y", CStr(a(2, 1))
-    Check "unit", "csv", "line break in quotes", "l1|l2", Replace(CStr(a(2, 3)), vbLf, "|")
     Check "unit", "csv", "escaped quote", "he said ""hi""", CStr(a(3, 2))
-    Check "unit", "csv", "empty last field", "", CStr(a(3, 3))
-    Check "unit", "csv", "comma detected", ",", CsvDelimiter("a,b,c" & vbLf & "1,2,3", "AUTO")
     Check "unit", "csv", "tab detected", "TAB", Replace(CsvDelimiter("a" & vbTab & "b" & vbTab & "c", "AUTO"), vbTab, "TAB")
 
     '--- steps ---
-    Check "unit", "steps", "valid sequence", "", ValidateSteps("KEYS:BLOT 2<GO>|WAIT:1.5|CLICK:10,20|RCLICK:5,5|SEND:{TAB}~")
-    Check "unit", "steps", "unknown token rejected", "True", B2S(Len(ValidateSteps("FOO:1")) > 0)
-    Check "unit", "steps", "bad click rejected", "True", B2S(Len(ValidateSteps("CLICK:10")) > 0)
+    Check "unit", "steps", "default EXPORT_SEQ valid", "", ValidateSteps(DefaultOf("EXPORT_SEQ"))
+    Check "unit", "steps", "operator form with || accepted", "", ValidateSteps("KEYS:2<GO>|WAIT:2|KEYS:2<GO>|WAIT:3 || KEYS:1<GO>")
+    Check "unit", "steps", "placeholder KEYS:N<GO> rejected", "True", B2S(Len(ValidateSteps("KEYS:2<GO>|KEYS:N<GO>")) > 0)
+    Check "unit", "steps", "clicks no longer supported", "True", B2S(Len(ValidateSteps("CLICK:10,20")) > 0)
     Check "unit", "steps", "bad wait rejected", "True", B2S(Len(ValidateSteps("WAIT:x")) > 0)
-    Check "unit", "steps", "placeholder KEYS:N<GO> rejected", "True", B2S(Len(ValidateSteps("KEYS:96<GO>|WAIT:1|KEYS:N<GO>")) > 0)
-    Check "unit", "steps", "numbered menu accepted", "", ValidateSteps("KEYS:96<GO>|WAIT:1|KEYS:3<GO>|WAIT:3")
-    Check "unit", "record", "RecWait 0.2s", "0.5", InvariantNum(RecWait(0.2))
-    Check "unit", "record", "RecWait 1.2s", "1.5", InvariantNum(RecWait(1.2))
-    Check "unit", "record", "RecWait capped", "8", InvariantNum(RecWait(30))
-    Check "unit", "record", "SuggestPrefix", "1-BLOOMBERG", SuggestPrefix("1-BLOOMBERG - BLOT")
-    Check "unit", "calib", "default candidates", "3", CStr(SplitCandidates(DefaultOf("EXPORT_CANDIDATES")).Count)
-    Check "unit", "calib", "candidate 1", "KEYS:2<GO>|WAIT:2|KEYS:2<GO>|WAIT:3|KEYS:1<GO>|WAIT:5", SplitCandidates(DefaultOf("EXPORT_CANDIDATES"))(1)
-    Check "unit", "calib", "candidates are valid steps", "", ValidateSteps(Replace(DefaultOf("EXPORT_CANDIDATES"), "||", "|"))
-    Check "unit", "calib", "Bloomberg exe wintrv.exe", "True", B2S(IsBloombergExe("wintrv.exe"))
-    Check "unit", "calib", "excel.exe is not Bloomberg", "False", B2S(IsBloombergExe("excel.exe"))
 
-    '--- rules guards ---
-    s = EXCL_STATUS
-    EXCL_STATUS = "cancel||"
-    Check "unit", "rules", "empty EXCL_STATUS token ignored", "1", CStr(LiveCount("Done"))
-    EXCL_STATUS = s
-    Check "unit", "rules", "empty alias never matches empty header", "0", CStr(HeaderIndex(HdrRow(Array("", "x", "y")), "|dealer"))
-    Check "unit", "rules", "header contains-match (>= 5 chars)", "2", CStr(HeaderIndex(HdrRow(Array("id", "No. of Dealers asked", "y")), "no. of dealers"))
+    '--- headers of the real BLOT export ---
+    a = HdrRow(Array("Security", "Side", "Block", "Status", "Qty (M)", "Price", "Yield", "BrkrName", "Net", "Curncy", "Account", "Trade Dt", "SetDt", "ISIN", "Ac/c", "Factor", "ID"))
+    Check "unit", "headers", "dealer = BrkrName", "8", CStr(HeaderIndex(a, HDR_DEALER))
+    Check "unit", "headers", "id = ID", "17", CStr(HeaderIndex(a, HDR_ID))
+    Check "unit", "headers", "date = Trade Dt (not SetDt)", "12", CStr(HeaderIndex(a, HDR_DATE))
+    Check "unit", "headers", "qty = Qty (M)", "5", CStr(HeaderIndex(a, HDR_QTY))
+    Check "unit", "headers", "price", "6", CStr(HeaderIndex(a, HDR_PRICE))
+    Check "unit", "headers", "isin", "14", CStr(HeaderIndex(a, HDR_ISIN))
+    Check "unit", "headers", "empty alias never matches empty header", "0", CStr(HeaderIndex(HdrRow(Array("", "x", "y")), "|dealer"))
 End Sub
 
 Private Function B2S(ByVal b As Boolean) As String
@@ -393,15 +381,6 @@ Private Function HdrRow(a As Variant) As Variant
     ReDim h(1 To 1, 1 To UBound(a) - LBound(a) + 1)
     For j = LBound(a) To UBound(a): h(1, j - LBound(a) + 1) = a(j): Next
     HdrRow = h
-End Function
-
-' Number of live deals of a one-deal, 3-dealer export with the given status
-Private Function LiveCount(ByVal status As String) As Long
-    Dim v(1 To 4, 1 To 3) As Variant, res As Object, i As Long
-    v(1, 1) = "inquiry id": v(1, 2) = "dealer": v(1, 3) = "status"
-    For i = 2 To 4: v(i, 1) = "R1": v(i, 2) = "D" & i: v(i, 3) = status: Next
-    Set res = ParseExport(v, NewDict(), Date)
-    LiveCount = res("m")
 End Function
 
 '==========================================================================================

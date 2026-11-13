@@ -1,22 +1,19 @@
 Attribute VB_Name = "modBlotBestEx"
 Option Explicit
 '==========================================================================================
-' BLOT -> Best Execution monitor  (Banco de Portugal rule: >= MIN_Q counterparties asked/deal)
-' v4 - configuration on the CONFIG sheet (modConfig), pure parsing core (ParseExport),
-'      raw-export archive, per-date history, holidays, re-entrancy guard, self-tests
+' BLOT -> Best Execution monitor v5 (Banco de Portugal: >= MIN_Q counterparties ASKED per request)
 '------------------------------------------------------------------------------------------
-' Public macros (buttons on DASHBOARD / CONFIG)
-'   CalibrateExport        tries the EXPORT_CANDIDATES one by one and keeps the one that exports
-'   RecordExport           learns EXPORT_SEQ from ONE manual export (records clicks / keys on Bloomberg)
-'   ListWindows            logs the visible window titles (to find BBG_TITLE_PREFIX)
-'   RunBlotReport          end-to-end: open BLOT -> export -> parse -> archive -> history -> alerts
-'   ValidateConfig         (modConfig) checks CONFIG, writes PASS/WARN/FAIL on CONFIG
-'   TestExport             TEST_EXPORT_RUNS cycles of OPEN_SEQ + EXPORT_SEQ + detection (no history)
-'   CaptureClickPoint      records a CLICK:x,y token relative to the Bloomberg window
-'   ImportFromFile         backfill / manual load of one or more export files
-'   RunSelfTests           (modSelfTest) fixture-driven tests of the parsing core
-'   AbortRun               resets a stuck run and cancels the pending poll
-' Other: Setup, TestDDE, ImportActiveWorkbook, ScheduleDaily, ScheduledRun, CancelSchedule
+' Export layout (Bloomberg BLOT, one row per DEALER LEG of a quote request):
+'   Security | Side | Block | Status | Qty (M) | Price | Yield | BrkrName | ... | Trade Dt | ISIN | ... | ID
+' Rule:
+'   request  = rows whose ID is equal except the last ID_SUFFIX_LEN characters (the dealer leg)
+'              FITDNA:6AF5A884011800|03, |05, |06 = one request to 3 dealers
+'              checked: one ISIN, one side, one trade date per request, else KEY?
+'   asked    = distinct dealers (BrkrName, DEALER_MAP applied), whatever their status
+'   quoted   = distinct dealers whose row has a price
+'   filled   = a row whose status matches FILL_STATUS (winner = that dealer)
+'   check    = BREACH (filled, asked < MIN_Q) | LOW (not filled, asked < MIN_Q) | KEY? | OK
+' Buttons: Run Now, Process Pasted Data, Import File, Test Export, Validate Config, Abort
 '==========================================================================================
 
 '------------------------------------ WIN32 ----------------------------------------------
@@ -26,67 +23,31 @@ Private Type GUID_T
     Data3 As Integer
     Data4(0 To 7) As Byte
 End Type
-Private Type RECT_T
-    Left As Long
-    Top As Long
-    Right As Long
-    Bottom As Long
-End Type
-Private Type POINT_T
-    X As Long
-    Y As Long
-End Type
-
 Private Declare PtrSafe Function FindWindowEx Lib "user32" Alias "FindWindowExA" (ByVal hWndParent As LongPtr, ByVal hWndChildAfter As LongPtr, ByVal lpszClass As String, ByVal lpszWindow As String) As LongPtr
 Private Declare PtrSafe Function GetWindowText Lib "user32" Alias "GetWindowTextA" (ByVal hwnd As LongPtr, ByVal lpString As String, ByVal cch As Long) As Long
 Private Declare PtrSafe Function IsWindowVisible Lib "user32" (ByVal hwnd As LongPtr) As Long
 Private Declare PtrSafe Function IsIconic Lib "user32" (ByVal hwnd As LongPtr) As Long
 Private Declare PtrSafe Function ShowWindow Lib "user32" (ByVal hwnd As LongPtr, ByVal nCmdShow As Long) As Long
 Private Declare PtrSafe Function SetForegroundWindow Lib "user32" (ByVal hwnd As LongPtr) As Long
-Private Declare PtrSafe Function GetWindowRect Lib "user32" (ByVal hwnd As LongPtr, lpRect As RECT_T) As Long
-Private Declare PtrSafe Function GetCursorPos Lib "user32" (lpPoint As POINT_T) As Long
-Private Declare PtrSafe Function SetCursorPos Lib "user32" (ByVal X As Long, ByVal Y As Long) As Long
-Private Declare PtrSafe Sub mouse_event Lib "user32" (ByVal dwFlags As Long, ByVal dx As Long, ByVal dy As Long, ByVal cButtons As Long, ByVal dwExtraInfo As LongPtr)
 Private Declare PtrSafe Function AccessibleObjectFromWindow Lib "oleacc" (ByVal hwnd As LongPtr, ByVal dwId As Long, riid As GUID_T, ppvObject As Object) As Long
 Private Declare PtrSafe Function IIDFromString Lib "ole32" (ByVal lpsz As LongPtr, lpiid As GUID_T) As Long
-
 Private Const OBJID_NATIVEOM As Long = &HFFFFFFF0
-Private Const MOUSE_LDOWN    As Long = &H2
-Private Const MOUSE_LUP      As Long = &H4
-Private Const MOUSE_RDOWN    As Long = &H8
-Private Const MOUSE_RUP      As Long = &H10
-Private Const SW_RESTORE     As Long = 9
-Private Const SW_MAXIMIZE    As Long = 3
-Private Const GA_ROOT        As Long = 2
-Private Const VK_LBUTTON     As Long = &H1
-Private Const VK_RBUTTON     As Long = &H2
-
-Private Declare PtrSafe Function GetAsyncKeyState Lib "user32" (ByVal vKey As Long) As Integer
-Private Declare PtrSafe Function GetForegroundWindow Lib "user32" () As LongPtr
-Private Declare PtrSafe Function GetAncestor Lib "user32" (ByVal hwnd As LongPtr, ByVal gaFlags As Long) As LongPtr
-Private Declare PtrSafe Function IsZoomed Lib "user32" (ByVal hwnd As LongPtr) As Long
-Private Declare PtrSafe Function GetWindowThreadProcessId Lib "user32" (ByVal hwnd As LongPtr, lpdwProcessId As Long) As Long
-Private Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
-Private Declare PtrSafe Function OpenProcess Lib "kernel32" (ByVal dwDesiredAccess As Long, ByVal bInheritHandle As Long, ByVal dwProcessId As Long) As LongPtr
-Private Declare PtrSafe Function QueryFullProcessImageName Lib "kernel32" Alias "QueryFullProcessImageNameA" (ByVal hProcess As LongPtr, ByVal dwFlags As Long, ByVal lpExeName As String, lpdwSize As Long) As Long
-Private Declare PtrSafe Function CloseHandle Lib "kernel32" (ByVal hObject As LongPtr) As Long
-Private Const PROCESS_QUERY_LIMITED_INFORMATION As Long = &H1000
+Private Const SW_RESTORE As Long = 9
 
 '------------------------------------ CONSTANTS ------------------------------------------
-Public Const NCOL As Long = 10            ' DEALS / HIST columns
+Public Const UCOLS As Long = 16      ' INQUIRIES / HIST columns
+Public Const QCOLS As Long = 13      ' QUOTES columns
 Public Const LV_INFO  As String = "INFO"
 Public Const LV_WARN  As String = "WARN"
 Public Const LV_ALERT As String = "ALERT"
 Public Const LV_ERROR As String = "ERROR"
 
 '------------------------------------ STATE ----------------------------------------------
-Public gHeadless As Boolean               ' TRUE during build / headless self-tests: no popup, no e-mail
+Public gHeadless As Boolean
 Private gT0 As Date, gSince As Date, gDeadline As Date, gNextRun As Date, gSchedPending As Boolean
 Private gKnown As String, gCandKey As String, gCandRows As Long, gBusy As Boolean, gKind As String
 Private gPollAt As Date, gPollPending As Boolean, gCycleAt As Date, gCyclePending As Boolean
 Private gTestN As Long, gTestI As Long, gTestOK As Long, gLastErr As String, gWarned As String
-Private gRecTxtWait As Double, gRecTxtMain As Boolean, gWinChecked As Boolean
-Private gCycleProc As String, gCands As Collection, gCalI As Long, gExeCache As Object
 
 '==========================================================================================
 '                                    ENTRY POINTS
@@ -95,8 +56,7 @@ Public Sub RunBlotReport()
     On Error GoTo EH
     LoadConfig
     If Not BeginRun("RUN") Then Exit Sub
-    Notify "Run started: SOURCE_MODE=" & SOURCE_MODE & ", expected trade date " & _
-           Format$(PrevBusinessDay(Date), "yyyy-mm-dd") & " (DAYS_BACK=" & DaysBack(Date) & ").", LV_INFO
+    Notify "Run started: expected trade date " & Format$(PrevBusinessDay(Date), "yyyy-mm-dd") & ".", LV_INFO
     If Not StartAcquisition() Then FinishRun
     Exit Sub
 EH:
@@ -105,20 +65,14 @@ EH:
 End Sub
 
 Public Sub PollExport()
-    Dim found As Boolean
     gPollPending = False
     If Not gBusy Then Exit Sub
     On Error GoTo EH
-    found = TryAcquire()
-    If found Then Exit Sub
+    If TryAcquire() Then Exit Sub
 Reschedule:
     On Error GoTo 0
     If Not gBusy Then Exit Sub
-    If Now < gDeadline Then
-        SchedulePoll
-    Else
-        OnAcquireTimeout
-    End If
+    If Now < gDeadline Then SchedulePoll Else OnAcquireTimeout
     Exit Sub
 EH:
     gLastErr = Err.Description
@@ -129,55 +83,83 @@ Public Sub AbortRun()
     CancelPending
     gBusy = False: gKind = ""
     Application.StatusBar = False
-    Notify "Run aborted by the operator (state reset, pending poll cancelled).", LV_WARN, False, True
+    Notify "Run aborted by the operator.", LV_WARN, False, True
 End Sub
 
-Public Sub TestDDE()
-    Dim msg As String, ch As Long
+' Paste the BLOT grid (with its header row) on the PASTE sheet, then this button
+Public Sub ProcessPasted()
+    Dim ws As Worksheet, a As Variant, r As Long, lc As Long, ur As Range, v As Variant, vRaw As Variant
+    On Error GoTo EH
     LoadConfig
-    If DdeAvailable(msg) Then
-        On Error Resume Next
-        ch = Application.DDEInitiate("WINBLP", "BBK")
-        Application.DDEExecute ch, BBG_PANEL & "BLOT<GO>"
-        Application.DDETerminate ch
-        On Error GoTo 0
-        Notify "TestDDE: " & msg & " Sent " & BBG_PANEL & "BLOT<GO>.", LV_INFO, True, True
-    Else
-        Notify "TestDDE: " & msg, LV_WARN, True, True
-    End If
+    Set ws = GetSheet(SH_PASTE)
+    Set ur = ws.UsedRange
+    If ur.Cells.CountLarge < 3 Then Notify "PASTE is empty: paste the BLOT grid (with its header row) from cell A3.", LV_WARN, True, True: Exit Sub
+    a = ur.Value2
+    r = FindHeaderRow(a, lc)
+    If r = 0 Then Notify "PASTE: no header row with a dealer column (" & Split(HDR_DEALER, "|")(0) & ") and an ID / ISIN column.", LV_WARN, True, True: Exit Sub
+    If Not BeginRun("IMPORT") Then Exit Sub
+    v = SliceBlock(a, r, lc)
+    vRaw = ur.Cells(r, 1).Resize(UBound(a, 1) - r + 1, lc).Value
+    ProcessData v, vRaw, "pasted data", Nothing, ""
+    FinishRun
+    GetSheet(SH_DASH).Activate
+    Exit Sub
+EH:
+    FinishRun
+    Notify "ERROR in ProcessPasted: " & Err.Description, LV_ERROR, True, True
 End Sub
 
-Public Function DdeAvailable(ByRef msg As String) As Boolean
-    Dim ch As Long, da As Boolean
-    If Application.IgnoreRemoteRequests Then
-        msg = "Excel option 'Ignore other applications that use Dynamic Data Exchange (DDE)' is ON: turn it off (File > Options > Advanced > General)."
-        Exit Function
+Public Sub ClearPaste()
+    With GetSheet(SH_PASTE)
+        .Range(.Cells(3, 1), .Cells(.Rows.Count, 60)).Clear
+    End With
+End Sub
+
+Public Sub ImportFromFile()
+    Dim files As Variant, f As Variant, n As Long, tot As Long
+    On Error GoTo EH
+    LoadConfig
+    files = Application.GetOpenFilename("BLOT export (*.xls*;*.csv),*.xls*;*.csv", , "Select BLOT export file(s)", , True)
+    If Not IsArray(files) Then Exit Sub
+    If Not BeginRun("IMPORT") Then Exit Sub
+    For Each f In files
+        tot = tot + 1
+        If ImportOneFile(CStr(f)) Then n = n + 1
+    Next
+    FinishRun
+    GetSheet(SH_DASH).Activate
+    Notify "Import finished: " & n & " of " & tot & " file(s) loaded.", LV_INFO, True, True
+    Exit Sub
+EH:
+    FinishRun
+    Notify "ERROR in ImportFromFile: " & Err.Description, LV_ERROR
+End Sub
+
+Private Function ImportOneFile(ByVal f As String) As Boolean
+    Dim blk As Object, wb As Workbook
+    On Error GoTo EH
+    Set blk = OpenExportFile(f, wb)
+    If blk Is Nothing Then
+        Notify "Import: no BLOT header row in " & f & ".", LV_WARN
+    Else
+        ImportOneFile = ProcessData(blk("v"), blk("raw"), "file " & f, Nothing, f)
     End If
-    da = Application.DisplayAlerts: Application.DisplayAlerts = False
-    On Error GoTo Fail
-    ch = Application.DDEInitiate("WINBLP", "BBK")
-    Application.DDETerminate ch
-    Application.DisplayAlerts = da
-    msg = "DDE link WINBLP|BBK OK."
-    DdeAvailable = True
+    If Not wb Is Nothing Then wb.Close False
     Exit Function
-Fail:
-    Application.DisplayAlerts = da
-    msg = "DDE link WINBLP|BBK failed (" & Err.Description & "). Terminal running and logged in?"
+EH:
+    Notify "ERROR importing " & f & ": " & Err.Description, LV_ERROR
+    On Error GoTo -1
+    On Error Resume Next
+    If Not wb Is Nothing Then wb.Close False
 End Function
 
-' TEST_EXPORT_RUNS consecutive cycles of the real acquisition path; nothing is written to history
+' TEST_EXPORT_RUNS cycles of OPEN_SEQ + EXPORT_SEQ + detection; nothing written to history
 Public Sub TestExport()
     On Error GoTo EH
     LoadConfig
-    If SOURCE_MODE = "TERMINAL" And Len(EXPORT_SEQ) = 0 Then
-        Notify "TestExport: EXPORT_SEQ is empty (CONFIG). Record it with Capture Click Point or numbered items.", LV_WARN, True, True
-        Exit Sub
-    End If
     If Not BeginRun("TEST") Then Exit Sub
-    gTestN = IIf(SOURCE_MODE = "TERMINAL", Application.WorksheetFunction.Max(1, TEST_EXPORT_RUNS), 1)
-    gTestI = 0: gTestOK = 0
-    Notify "TestExport started: " & gTestN & " cycle(s), SOURCE_MODE=" & SOURCE_MODE & ".", LV_INFO
+    gTestN = TEST_EXPORT_RUNS: gTestI = 0: gTestOK = 0
+    Notify "TestExport started: " & gTestN & " cycles.", LV_INFO
     StartTestCycle
     Exit Sub
 EH:
@@ -197,504 +179,23 @@ EH:
     TestCycleDone False, "error: " & Err.Description
 End Sub
 
-Public Sub CaptureClickPoint()
-    Dim h As LongPtr, rc As RECT_T, pt As POINT_T, tok As String, ans As VbMsgBoxResult
-    On Error GoTo EH
-    LoadConfig
-    h = BbgHwnd()
-    If h = 0 Then MsgBox "Bloomberg window '" & BBG_TITLE_PREFIX & "' not found.", vbCritical: Exit Sub
-    MsgBox "After OK you have 5 seconds: place the mouse over the target button in the Bloomberg window and keep it still.", vbInformation
-    WaitSec 5
-    GetCursorPos pt: GetWindowRect h, rc
-    tok = "CLICK:" & (pt.X - rc.Left) & "," & (pt.Y - rc.Top)
-    WriteLog "CaptureClickPoint: " & tok & " (window at " & rc.Left & "," & rc.Top & " size " & (rc.Right - rc.Left) & "x" & (rc.Bottom - rc.Top) & ")", LV_INFO
-    ans = MsgBox("Captured step token:" & vbLf & vbLf & tok & vbLf & vbLf & _
-                 "Append it to EXPORT_SEQ on the CONFIG sheet?" & vbLf & "(a WAIT:1 step is inserted before it when EXPORT_SEQ is not empty)", _
-                 vbYesNo + vbQuestion, "CaptureClickPoint")
-    If ans = vbYes Then
-        AppendStepToConfig "EXPORT_SEQ", tok
-        MsgBox "EXPORT_SEQ updated. Run Test Export to verify (5/5).", vbInformation
+Public Function DdeAvailable(ByRef msg As String) As Boolean
+    Dim ch As Long, da As Boolean
+    If Application.IgnoreRemoteRequests Then
+        msg = "Excel option 'Ignore other applications that use DDE' is ON: turn it off (Options > Advanced > General)."
+        Exit Function
     End If
-    Exit Sub
-EH:
-    Notify "ERROR in CaptureClickPoint: " & Err.Description, LV_ERROR, True, True
-End Sub
-
-Public Sub ImportActiveWorkbook()
-    Dim blk As Object, wb As Workbook
-    On Error GoTo EH
-    LoadConfig
-    Set wb = ActiveWorkbook
-    If wb Is ThisWorkbook Then MsgBox "Activate the export workbook first.", vbExclamation: Exit Sub
-    If Not BeginRun("IMPORT") Then Exit Sub
-    Set blk = FindBlockInWorkbook(wb)
-    If blk Is Nothing Then
-        Notify "ImportActiveWorkbook: no header row with a dealer column (HDR_DEALERS) in " & wb.Name & ".", LV_WARN, True, True
-    Else
-        ProcessData blk("v"), blk("raw"), "workbook " & blk("label"), wb, ""
-    End If
-    FinishRun
-    Exit Sub
-EH:
-    FinishRun
-    Notify "ERROR in ImportActiveWorkbook: " & Err.Description, LV_ERROR
-End Sub
-
-Public Sub ImportFromFile()
-    Dim files As Variant, f As Variant, n As Long, tot As Long
-    On Error GoTo EH
-    LoadConfig
-    files = Application.GetOpenFilename("BLOT export (*.xls*;*.csv),*.xls*;*.csv", , "Select BLOT export file(s)", , True)
-    If Not IsArray(files) Then Exit Sub
-    If Not BeginRun("IMPORT") Then Exit Sub
-    For Each f In files
-        tot = tot + 1
-        If ImportOneFile(CStr(f)) Then n = n + 1
-    Next
-    FinishRun
-    Notify "Import finished: " & n & " of " & tot & " file(s) loaded.", LV_INFO, True, True
-    Exit Sub
-EH:
-    FinishRun
-    Notify "ERROR in ImportFromFile: " & Err.Description, LV_ERROR
-End Sub
-
-Private Function ImportOneFile(ByVal f As String) As Boolean
-    Dim blk As Object, wb As Workbook
-    On Error GoTo EH
-    If IsCsvPath(f) Then
-        Set blk = CsvBlock(f)
-    Else
-        Set wb = Workbooks.Open(f, UpdateLinks:=0, ReadOnly:=True)
-        Set blk = FindBlockInWorkbook(wb)
-    End If
-    If blk Is Nothing Then
-        Notify "Import: no header row with a dealer column (HDR_DEALERS) in " & f & ".", LV_WARN
-    Else
-        ImportOneFile = ProcessData(blk("v"), blk("raw"), "file " & f, Nothing, f)
-    End If
-    If Not wb Is Nothing Then wb.Close False
+    da = Application.DisplayAlerts: Application.DisplayAlerts = False
+    On Error GoTo Fail
+    ch = Application.DDEInitiate("WINBLP", "BBK")
+    Application.DDETerminate ch
+    Application.DisplayAlerts = da
+    msg = "DDE link to Bloomberg OK."
+    DdeAvailable = True
     Exit Function
-EH:
-    Notify "ERROR importing " & f & ": " & Err.Description, LV_ERROR
-    On Error GoTo -1
-    On Error Resume Next
-    If Not wb Is Nothing Then wb.Close False
-End Function
-
-'==========================================================================================
-'                                    CALIBRATE EXPORT (tries EXPORT_CANDIDATES)
-'==========================================================================================
-Public Sub CalibrateExport()
-    Dim c As Variant, lst As String, i As Long
-    On Error GoTo EH
-    LoadConfig
-    If SOURCE_MODE <> "TERMINAL" Then MsgBox "Calibrate Export is for SOURCE_MODE = TERMINAL.", vbExclamation: Exit Sub
-    Set gCands = SplitCandidates(EXPORT_CANDIDATES)
-    If gCands.Count = 0 Then MsgBox "EXPORT_CANDIDATES is empty on CONFIG.", vbExclamation: Exit Sub
-    For Each c In gCands: i = i + 1: lst = lst & i & ") " & c & vbLf: Next
-    If MsgBox("Calibrate Export tries these export sequences one after the other" & vbLf & _
-              "(each one: BLOT 2 / BLOT -1, the steps, then up to " & CALIB_WAIT_S & " s waiting for the export):" & vbLf & vbLf & lst & vbLf & _
-              "It stops at the first one that produces the export and saves it as EXPORT_SEQ." & vbLf & _
-              "Do not touch keyboard or mouse until the result message. Start?", vbOKCancel + vbQuestion, "Calibrate Export") <> vbOK Then Exit Sub
-    If Not BeginRun("CALIB") Then Exit Sub
-    gCalI = 0
-    Notify "Calibrate Export started: " & gCands.Count & " candidate(s).", LV_INFO
-    StartCalibCycle
-    Exit Sub
-EH:
-    FinishRun
-    Notify "ERROR in CalibrateExport: " & Err.Description, LV_ERROR, True, True
-End Sub
-
-Public Sub StartCalibCycle()
-    gCyclePending = False
-    If Not gBusy Or gKind <> "CALIB" Then Exit Sub
-    On Error GoTo EH
-    gCalI = gCalI + 1
-    If gCalI > gCands.Count Then
-        FinishRun
-        Notify "Calibrate Export: none of the " & gCands.Count & " candidate(s) produced an export. " & _
-               "Next: Record Export, or send the LOG (List Windows + these lines).", LV_WARN, True, True
-        Exit Sub
-    End If
-    EXPORT_SEQ = gCands(gCalI)
-    Application.StatusBar = "BLOT Calibrate Export: candidate " & gCalI & "/" & gCands.Count
-    Notify "Calibrate Export: trying " & gCalI & "/" & gCands.Count & ": " & EXPORT_SEQ, LV_INFO
-    If StartAcquisition() Then
-        gDeadline = Now + TimeSerial(0, 0, CALIB_WAIT_S)
-    Else
-        CalibCycleDone False, "steps failed (see LOG)"
-    End If
-    Exit Sub
-EH:
-    CalibCycleDone False, "error: " & Err.Description
-End Sub
-
-Private Sub CalibCycleDone(ByVal ok As Boolean, ByVal detail As String, Optional v As Variant, Optional ByVal srcFile As String = "")
-    Dim res As Object, seq As String, fld As String
-    CancelPending
-    seq = gCands(gCalI)
-    If ok Then
-        FinishRun
-        If Len(srcFile) > 0 Then fld = Left$(srcFile, InStrRev(srcFile, "\") - 1)
-        SetConfigValue "EXPORT_SEQ", seq
-        If Len(fld) > 0 Then SetConfigValue "EXPORT_FOLDER", fld
-        If Not IsMissing(v) Then
-            Set res = ParseExport(v, LoadDealerMap(), PrevBusinessDay(Date))
-            detail = detail & vbLf & "Parse: " & res("m") & " deal(s), mode=" & res("mode") & vbLf & "Header mapping: " & res("mapping")
-            If Len(res("err")) > 0 Then detail = detail & vbLf & "Parse error: " & res("err")
-        End If
-        Notify "Calibrate Export: candidate " & gCalI & " WORKS and was saved as EXPORT_SEQ = " & seq & _
-               IIf(Len(fld) > 0, " (export saved as a file in " & fld & ": saved as EXPORT_FOLDER)", "") & "." & vbLf & _
-               "Export detected: " & detail & vbLf & "Next: close the export workbook and click Test Export (must be 5/5).", LV_INFO, True, True
-        Exit Sub
-    End If
-    Notify "Calibrate Export: candidate " & gCalI & " did not export (" & detail & ").", LV_WARN, False, True
-    On Error Resume Next
-    If BbgFocusUnlessOwn() Then SendKeys "{ESC}", True                       ' close a menu left open
-    On Error GoTo 0
-    gCycleAt = Now + TimeSerial(0, 0, 3): gCycleProc = "StartCalibCycle"
-    Application.OnTime gCycleAt, ProcName(gCycleProc)
-    gCyclePending = True
-End Sub
-
-' "seq1 || seq2 || seq3"
-Public Function SplitCandidates(ByVal s As String) As Collection
-    Dim c As New Collection, a As Variant
-    For Each a In Split(s, "||")
-        If Len(Trim$(CStr(a))) > 0 Then c.Add Trim$(CStr(a))
-    Next
-    Set SplitCandidates = c
-End Function
-
-' Folders where a Bloomberg export may be saved as a file (watched during calibration only)
-Private Function CalibFolders() As Collection
-    Dim c As New Collection, f As Variant
-    For Each f In Array(Environ$("USERPROFILE") & "\Downloads", Environ$("USERPROFILE") & "\Documents", "C:\blp\data", "C:\blp\Export")
-        If Len(Dir$(CStr(f), vbDirectory)) > 0 Then c.Add CStr(f)
-    Next
-    Set CalibFolders = c
-End Function
-
-Public Sub EnsureFolder(ByVal p As String)
-    Dim fso As Object
-    On Error Resume Next
-    Set fso = CreateObject("Scripting.FileSystemObject")
-    If Not fso.FolderExists(p) Then
-        If fso.FolderExists(fso.GetParentFolderName(p)) Then fso.CreateFolder p
-    End If
-End Sub
-
-'==========================================================================================
-'                                    RECORD EXPORT (learns EXPORT_SEQ from one manual export)
-'==========================================================================================
-Public Sub RecordExport()
-    Dim bb As LongPtr, bbPid As Long, fgRaw As LongPtr, root As LongPtr, rc As RECT_T, pt As POINT_T
-    Dim t0 As Double, tLast As Double, tNow As Double, tCheck As Double, tStop As Double
-    Dim toks As Collection, txt As String, prevL As Boolean, prevR As Boolean, l As Boolean, r As Boolean
-    Dim kPrev(0 To 255) As Boolean, vk As Long, kd As Boolean, inB As Boolean, isMain As Boolean
-    Dim known As String, newWb As String, stopWhy As String, seq As String, title As String, prefix As String
-    Dim lastX As Long, lastY As Long, lastT As Double, x As Long, y As Long, winInfo As String
-    Dim ans As VbMsgBoxResult, identify As Boolean
-    On Error GoTo EH
-    LoadConfig
-    If gBusy Then MsgBox "A run is in progress: click Abort first.", vbExclamation: Exit Sub
-    ans = MsgBox("RECORD EXPORT - the macro learns EXPORT_SEQ from ONE export done by hand." & vbLf & vbLf & _
-        "1. YES = first run OPEN_SEQ (BLOT 2 / BLOT -1) exactly like the daily run (recommended)." & vbLf & _
-        "2. Then do the export BY HAND in the Bloomberg panel, the way you always do it:" & vbLf & _
-        "   clicks, right-clicks, menu numbers + <GO>, Enter, Esc, until the export opens in Excel." & vbLf & _
-        "3. Recording stops by itself when the export workbook appears" & vbLf & _
-        "   (or Ctrl+Shift+Q, or after 3 minutes). Clicks outside Bloomberg are ignored." & vbLf & vbLf & _
-        "If the Bloomberg window is not recognised yet, your FIRST click on it only identifies it." & vbLf & vbLf & _
-        "Run OPEN_SEQ first?", vbYesNoCancel + vbQuestion, "Record Export")
-    If ans = vbCancel Then Exit Sub
-    If ans = vbYes Then
-        If Not RunSteps(ExpandSeq(OPEN_SEQ, Date)) Then Exit Sub
-    End If
-    known = SnapshotWorkbooks()
-    bb = BbgHwnd()
-    If bb <> 0 Then
-        GetWindowThreadProcessId bb, bbPid
-        BbgFocus
-    Else
-        identify = True
-    End If
-    Set toks = New Collection
-    For vk = 1 To 254: kPrev(vk) = KeyIsDown(vk): Next
-    prevL = kPrev(VK_LBUTTON): prevR = kPrev(VK_RBUTTON)
-    t0 = NowSec(): tLast = t0: tCheck = t0
-    Application.StatusBar = "BLOT Record Export: RECORDING - do the export in Bloomberg now (Ctrl+Shift+Q stops)"
-    WriteLog "Record Export started (Bloomberg window " & IIf(bb = 0, "not recognised yet: first click identifies it", "'" & WindowTitle(bb) & "'") & ").", LV_INFO
-    Do
-        Sleep 8
-        DoEvents
-        tNow = NowSec()
-        If tStop > 0 And tNow >= tStop Then Exit Do
-        If KeyIsDown(&H11) And KeyIsDown(&H10) And KeyIsDown(&H51) Then stopWhy = "stopped with Ctrl+Shift+Q": Exit Do
-        If tNow - t0 > 180 Then stopWhy = "3-minute limit": Exit Do
-
-        fgRaw = GetForegroundWindow(): root = GetAncestor(fgRaw, GA_ROOT)
-        inB = False: isMain = False
-        If bb <> 0 And root <> 0 Then
-            isMain = (root = bb)
-            inB = isMain Or (WindowPid(root) = bbPid And bbPid <> 0) Or IsBloombergWindow(root)
-        End If
-
-        l = KeyIsDown(VK_LBUTTON): r = KeyIsDown(VK_RBUTTON)
-        If ((l And Not prevL) Or (r And Not prevR)) And tStop = 0 Then
-            GetCursorPos pt
-            Sleep 40
-            fgRaw = GetForegroundWindow(): root = GetAncestor(fgRaw, GA_ROOT)
-            If identify Then
-                If root <> 0 And WindowPid(root) <> WindowPid(Application.Hwnd) Then
-                    bb = root: GetWindowThreadProcessId bb, bbPid: identify = False
-                    WriteLog "Record Export: Bloomberg window identified as '" & WindowTitle(bb) & "' [" & ProcessExe(bbPid) & "].", LV_INFO
-                End If
-            End If
-            If bb <> 0 And (root = bb Or (WindowPid(root) = bbPid And bbPid <> 0) Or IsBloombergWindow(root)) Then
-                GetWindowRect bb, rc
-                x = pt.X - rc.Left: y = pt.Y - rc.Top
-                FlushRecText toks, txt, tNow, tLast
-                If l And toks.Count > 0 And tNow - lastT < 0.45 And Abs(x - lastX) <= 4 And Abs(y - lastY) <= 4 And Left$(toks(toks.Count), 6) = "CLICK:" Then
-                    toks.Remove toks.Count
-                    toks.Add "DCLICK:" & x & "," & y
-                Else
-                    AddRecTok toks, IIf(l, "CLICK:", "RCLICK:") & x & "," & y, tNow, tLast
-                End If
-                lastX = x: lastY = y: lastT = tNow
-            End If
-        End If
-        prevL = l: prevR = r
-
-        For vk = 8 To 222
-            kd = KeyIsDown(vk)
-            If kd And Not kPrev(vk) And inB And tStop = 0 Then RecordKey toks, txt, vk, isMain, tNow, tLast
-            kPrev(vk) = kd
-        Next
-
-        If tNow - tCheck >= 1 And tStop = 0 Then
-            tCheck = tNow
-            newWb = NewWorkbookSince(known)
-            If Len(newWb) > 0 Then stopWhy = "export detected: " & newWb: tStop = tNow + 0.5
-        End If
-    Loop
-    FlushRecText toks, txt, NowSec(), tLast
-    Application.StatusBar = False
-
-    If toks.Count = 0 Then
-        Notify "Record Export: nothing was recorded on the Bloomberg window (" & stopWhy & ").", LV_WARN, True, True
-        Exit Sub
-    End If
-    seq = JoinTokens(toks) & "|WAIT:3"
-    title = WindowTitle(bb)
-    GetWindowRect bb, rc
-    winInfo = (rc.Right - rc.Left) & "x" & (rc.Bottom - rc.Top) & IIf(IsZoomed(bb) <> 0, ",MAX", "")
-    WriteLog "Record Export (" & stopWhy & "): EXPORT_SEQ = " & seq & " | window '" & title & "' " & winInfo, LV_INFO
-    ans = MsgBox("Recorded (" & stopWhy & "):" & vbLf & vbLf & seq & vbLf & vbLf & _
-                 "Bloomberg window: '" & title & "'  " & winInfo & vbLf & vbLf & _
-                 "Save it on CONFIG (replaces EXPORT_SEQ)?", vbYesNo + vbQuestion, "Record Export")
-    If ans <> vbYes Then Exit Sub
-    SetConfigValue "EXPORT_SEQ", seq
-    SetConfigValue "BBG_WINDOW", winInfo
-    If Len(title) > 0 And (Len(BBG_TITLE_PREFIX) = 0 Or UCase$(Left$(title, Len(BBG_TITLE_PREFIX))) <> UCase$(BBG_TITLE_PREFIX)) Then
-        prefix = InputBox("The Bloomberg window title is:" & vbLf & vbLf & title & vbLf & vbLf & _
-                          "Start of the title that ALWAYS identifies this panel (saved as BBG_TITLE_PREFIX):", "Record Export", SuggestPrefix(title))
-        If Len(prefix) > 0 Then SetConfigValue "BBG_TITLE_PREFIX", prefix
-    End If
-    If Len(newWb) = 0 Then
-        MsgBox "Saved. No export workbook was detected while recording - check that the last step really exported, then run Test Export.", vbExclamation, "Record Export"
-    Else
-        MsgBox "Saved. Close the export workbook '" & newWb & "', then click Test Export (it must succeed 5/5).", vbInformation, "Record Export"
-    End If
-    Exit Sub
-EH:
-    Application.StatusBar = False
-    Notify "ERROR in RecordExport: " & Err.Description, LV_ERROR, True, True
-End Sub
-
-Private Sub RecordKey(toks As Collection, ByRef txt As String, ByVal vk As Long, ByVal isMain As Boolean, ByVal tNow As Double, ByRef tLast As Double)
-    Dim ctl As Boolean, alt As Boolean, sh As Boolean, c As String, sk As String
-    Select Case vk
-        Case &H10, &H11, &H12, &H14, &H5B, &H5C, &H90, &H91, &HA0 To &HA5
-            Exit Sub                                          ' modifiers / locks
-    End Select
-    ctl = KeyIsDown(&H11): alt = KeyIsDown(&H12): sh = KeyIsDown(&H10)
-    If ctl And sh And vk = &H51 Then Exit Sub                 ' stop combination
-    c = KeyChar(vk)
-    If Len(c) > 0 And Not ctl And Not alt Then
-        If Len(txt) = 0 Then gRecTxtWait = RecWait(tNow - tLast): gRecTxtMain = isMain: tLast = tNow
-        txt = txt & c
-        Exit Sub
-    End If
-    Select Case vk
-        Case &HD                                              ' Enter = <GO>
-            If Len(txt) > 0 Then
-                If gRecTxtMain Then
-                    AddRecTokW toks, "KEYS:" & txt & "<GO>", gRecTxtWait
-                Else
-                    AddRecTokW toks, "SEND:" & EscKeys(txt) & "~", gRecTxtWait
-                End If
-                txt = "": tLast = tNow
-            Else
-                AddRecTok toks, "SEND:~", tNow, tLast
-            End If
-            Exit Sub
-        Case &H8
-            If Len(txt) > 0 Then txt = Left$(txt, Len(txt) - 1): Exit Sub
-            sk = "{BACKSPACE}"
-        Case &H1B: sk = "{ESC}"
-        Case &H9:  sk = IIf(sh, "+{TAB}", "{TAB}")
-        Case &H25: sk = "{LEFT}"
-        Case &H26: sk = "{UP}"
-        Case &H27: sk = "{RIGHT}"
-        Case &H28: sk = "{DOWN}"
-        Case &H21: sk = "{PGUP}"
-        Case &H22: sk = "{PGDN}"
-        Case &H24: sk = "{HOME}"
-        Case &H23: sk = "{END}"
-        Case &H2E: sk = "{DEL}"
-        Case &H70 To &H7B: sk = "{F" & (vk - &H6F) & "}"
-        Case Else
-            If Len(c) = 0 Then Exit Sub
-            sk = IIf(ctl, "^", "") & IIf(alt, "%", "") & LCase$(c)
-    End Select
-    FlushRecText toks, txt, tNow, tLast
-    AddRecTok toks, "SEND:" & sk, tNow, tLast
-End Sub
-
-Private Function KeyChar(ByVal vk As Long) As String
-    Select Case vk
-        Case &H30 To &H39: KeyChar = Chr$(vk)
-        Case &H60 To &H69: KeyChar = Chr$(vk - &H30)
-        Case &H41 To &H5A: KeyChar = Chr$(vk)
-        Case &H20: KeyChar = " "
-        Case &HBD, &H6D: KeyChar = "-"
-        Case &HBE, &H6E: KeyChar = "."
-        Case &HBC: KeyChar = ","
-    End Select
-End Function
-
-Private Sub FlushRecText(toks As Collection, ByRef txt As String, ByVal tNow As Double, ByRef tLast As Double)
-    If Len(txt) = 0 Then Exit Sub
-    AddRecTokW toks, "SEND:" & EscKeys(txt), gRecTxtWait
-    txt = "": tLast = tNow
-End Sub
-
-Private Sub AddRecTok(toks As Collection, ByVal tok As String, ByVal tNow As Double, ByRef tLast As Double)
-    AddRecTokW toks, tok, RecWait(tNow - tLast)
-    tLast = tNow
-End Sub
-
-Private Sub AddRecTokW(toks As Collection, ByVal tok As String, ByVal w As Double)
-    toks.Add "WAIT:" & InvariantNum(w)
-    toks.Add tok
-End Sub
-
-' Human pause -> WAIT seconds: rounded up to 0.5, between 0.5 and 8
-Public Function RecWait(ByVal dt As Double) As Double
-    Dim w As Double
-    w = -Int(-dt * 2) / 2
-    If w < 0.5 Then w = 0.5
-    If w > 8 Then w = 8
-    RecWait = w
-End Function
-
-Private Function JoinTokens(toks As Collection) As String
-    Dim t As Variant, s As String
-    For Each t In toks: s = s & "|" & t: Next
-    JoinTokens = Mid$(s, 2)
-End Function
-
-Public Function SuggestPrefix(ByVal title As String) As String
-    Dim p As Long
-    p = InStr(1, title, " - ")
-    If p > 1 Then SuggestPrefix = Left$(title, p - 1) Else SuggestPrefix = title
-End Function
-
-Private Function KeyIsDown(ByVal vk As Long) As Boolean
-    KeyIsDown = (GetAsyncKeyState(vk) And &H8000) <> 0
-End Function
-
-Private Function NowSec() As Double
-    NowSec = CDbl(Date) * 86400# + Timer
-End Function
-
-Private Function WindowPid(ByVal h As LongPtr) As Long
-    Dim pid As Long
-    If h <> 0 Then GetWindowThreadProcessId h, pid
-    WindowPid = pid
-End Function
-
-Private Function WindowTitle(ByVal h As LongPtr) As String
-    Dim s As String, l As Long
-    If h = 0 Then Exit Function
-    s = String$(260, vbNullChar): l = GetWindowText(h, s, 260)
-    If l > 0 Then WindowTitle = Left$(s, l)
-End Function
-
-Private Function NewWorkbookSince(ByVal known As String) As String
-    Dim app As Object, wb As Object
-    On Error Resume Next
-    For Each app In AllExcelApps()
-        For Each wb In app.Workbooks
-            If InStr(1, known, "|" & app.Hwnd & ":" & wb.FullName & "|", vbTextCompare) = 0 Then NewWorkbookSince = wb.Name: Exit Function
-        Next
-    Next
-End Function
-
-' Visible top-level window titles; onlyLikely = Bloomberg-looking titles only
-Public Function WindowCandidates(ByVal onlyLikely As Boolean) As String
-    Dim h As LongPtr, t As String, s As String, n As Long
-    h = FindWindowEx(0, 0, vbNullString, vbNullString)
-    Do While h <> 0 And n < 80
-        If IsWindowVisible(h) <> 0 Then
-            t = WindowTitle(h)
-            If Len(t) > 0 Then
-                If Not onlyLikely Or InStr(1, t, "bloomberg", vbTextCompare) > 0 Or InStr(1, t, "blp", vbTextCompare) > 0 _
-                   Or t Like "#-*" Or IsBloombergWindow(h) Then
-                    s = s & "'" & t & "' [" & ProcessExe(WindowPid(h)) & "]; ": n = n + 1
-                End If
-            End If
-        End If
-        h = FindWindowEx(0, h, vbNullString, vbNullString)
-    Loop
-    WindowCandidates = s
-End Function
-
-Public Sub ListWindows()
-    Dim c As String
-    LoadConfig
-    c = WindowCandidates(True)
-    WriteLog "Visible windows that look like Bloomberg: " & IIf(Len(c) = 0, "(none)", c), LV_INFO
-    WriteLog "All visible windows: " & WindowCandidates(False), LV_INFO
-    If Application.Visible Then
-        MsgBox "Windows that look like Bloomberg:" & vbLf & vbLf & IIf(Len(c) = 0, "(none - see LOG for all windows)", Replace(c, "; ", vbLf)) & vbLf & vbLf & _
-               "BBG_TITLE_PREFIX must be the start of the panel title (now: '" & BBG_TITLE_PREFIX & "'). Record Export sets it for you.", vbInformation, "List Windows"
-    End If
-End Sub
-
-' Before clicks: restore the window state / size used when EXPORT_SEQ was recorded (BBG_WINDOW)
-Private Sub CheckBbgWindow(ByVal h As LongPtr)
-    Dim rc As RECT_T, cur As String, want As String
-    If h = 0 Or Len(BBG_WINDOW) = 0 Then Exit Sub
-    If InStr(1, BBG_WINDOW, "MAX", vbTextCompare) > 0 And IsZoomed(h) = 0 Then ShowWindow h, SW_MAXIMIZE: WaitSec 0.8
-    GetWindowRect h, rc
-    cur = (rc.Right - rc.Left) & "x" & (rc.Bottom - rc.Top)
-    want = Split(BBG_WINDOW, ",")(0)
-    If cur <> want Then WriteLog "Bloomberg window is " & cur & " but EXPORT_SEQ was recorded at " & want & ": clicks may miss (maximize the panel on the same monitor or re-record).", LV_WARN
-End Sub
-
-' Focus Bloomberg unless a Bloomberg window (panel, menu or dialog) is already in front
-Private Function BbgFocusUnlessOwn() As Boolean
-    Dim h As LongPtr, pid As Long
-    h = BbgHwnd(): If h = 0 Then Exit Function
-    GetWindowThreadProcessId h, pid
-    If WindowPid(GetAncestor(GetForegroundWindow(), GA_ROOT)) = pid And pid <> 0 Then
-        BbgFocusUnlessOwn = True
-    Else
-        BbgFocusUnlessOwn = BbgFocus()
-    End If
+Fail:
+    Application.DisplayAlerts = da
+    msg = "DDE link to Bloomberg failed (" & Err.Description & "). Terminal running and logged in?"
 End Function
 
 '==========================================================================================
@@ -705,30 +206,28 @@ Public Sub Setup()
     On Error GoTo EH
     su = Application.ScreenUpdating: Application.ScreenUpdating = False
     For Each nm In SheetOrder(): GetSheet CStr(nm): Next
-
     WriteConfigSheet
     LoadConfig
 
     Set ws = GetSheet(SH_MAP)
     If Len(ws.Range("A1").Value) = 0 Then
-        ws.Range("A1:B1").Value = Array("Alias (as exported)", "Counterparty (legal entity)")
-        ws.Range("A1:B1").Font.Bold = True: ws.Range("A1:B1").Interior.Color = RGB(217, 225, 242)
-        ws.Columns("A:B").ColumnWidth = 32: ws.Columns("A:B").NumberFormat = "@"
-        ws.Range("D1").Value = "One row per alias. Example: JPM -> JPMORGAN, JPM LDN -> JPMORGAN, JPMS -> JPMORGAN."
-        ws.Range("D2").Value = "Matching ignores case and repeated spaces. Unmapped names are listed in LOG after every run."
+        ws.Range("A1:B1").Value = Array("BrkrName as exported", "Counterparty (legal entity)")
+        Hdr ws.Range("A1:B1")
+        ws.Columns("A:B").ColumnWidth = 34: ws.Columns("A:B").NumberFormat = "@"
+        ws.Range("D1").Value = "One row per spelling, e.g. 'BNP PARIB.' -> BNP PARIBAS. Matching ignores case and repeated spaces."
+        ws.Range("D2").Value = "Names not in this table are listed in LOG after every run."
         ws.Range("D1:D2").Font.Italic = True
     End If
-
-    EnsureHeader GetSheet(SH_HIST), HistHeader()
-    EnsureHeader GetSheet(SH_HD), HistDailyHeader()
-    EnsureLogHeader GetSheet(SH_LOG)
-    WriteReadme
-    If Len(GetSheet(SH_DEALS).Range("A2").Value) = 0 Then
-        BuildDashboard Empty, 0, "No run yet."
-    Else
-        AddSheetButtons GetSheet(SH_DASH), DashButtons()
+    Set ws = GetSheet(SH_PASTE)
+    If Len(ws.Range("A2").Value) = 0 Then
+        ws.Range("A2").Value = "Paste the BLOT grid (Ctrl+V, WITH its header row) from cell A3, then click 'Process Pasted Data'."
+        ws.Range("A2").Font.Bold = True
+        AddSheetButtons ws, Array("Process Pasted Data|ProcessPasted", "Clear|ClearPaste")
     End If
-    GetSheet(SH_FIX).Visible = xlSheetHidden
+    EnsureHeader GetSheet(SH_HIST), UnitHeader()
+    EnsureHeader GetSheet(SH_HD), DailyHeader()
+    EnsureLogHeader GetSheet(SH_LOG)
+    If Len(GetSheet(SH_INQ).Range("A2").Value) = 0 Then BuildDashboard Empty, 0, Nothing, "No run yet."
 
     da = Application.DisplayAlerts: Application.DisplayAlerts = False
     For i = ThisWorkbook.Worksheets.Count To 1 Step -1
@@ -738,16 +237,16 @@ Public Sub Setup()
         End If
     Next
     Application.DisplayAlerts = da
-    Set prev = Nothing
     For Each nm In SheetOrder()
         Set ws = GetSheet(CStr(nm))
         If prev Is Nothing Then ws.Move Before:=ThisWorkbook.Worksheets(1) Else ws.Move After:=prev
         Set prev = ws
     Next
+    GetSheet(SH_TESTS).Visible = xlSheetHidden
+    GetSheet(SH_FIX).Visible = xlSheetHidden
     GetSheet(SH_DASH).Activate
     Application.ScreenUpdating = su
-    WriteLog "Setup completed (sheets, CONFIG defaults, buttons, README).", LV_INFO
-    If Application.Visible And Not gHeadless Then MsgBox "Setup complete. Fill the yellow cells on CONFIG, then Validate Config.", vbInformation, "BLOT Best Execution"
+    WriteLog "Setup completed.", LV_INFO
     Exit Sub
 EH:
     Application.ScreenUpdating = True
@@ -756,7 +255,7 @@ EH:
 End Sub
 
 Private Function SheetOrder() As Variant
-    SheetOrder = Array(SH_README, SH_DASH, SH_CONFIG, SH_MAP, SH_DEALS, SH_HIST, SH_HD, SH_RAW, SH_LOG, SH_TESTS, SH_FIX)
+    SheetOrder = Array(SH_DASH, SH_INQ, SH_QUOTES, SH_PASTE, SH_HIST, SH_HD, SH_CONFIG, SH_MAP, SH_LOG, SH_TESTS, SH_FIX)
 End Function
 
 Private Function IsOwnSheet(ByVal nm As String) As Boolean
@@ -767,9 +266,8 @@ Private Function IsOwnSheet(ByVal nm As String) As Boolean
 End Function
 
 Public Function DashButtons() As Variant
-    DashButtons = Array("Run Now|RunBlotReport", "Validate Config|ValidateConfig", "Calibrate Export|CalibrateExport", "Record Export|RecordExport", _
-                        "Test Export|TestExport", "Capture Click Point|CaptureClickPoint", "Import File|ImportFromFile", _
-                        "Run Self-Tests|RunSelfTests", "Abort|AbortRun")
+    DashButtons = Array("Run Now|RunBlotReport", "Process Pasted Data|ProcessPasted", "Import File|ImportFromFile", _
+                        "Test Export|TestExport", "Validate Config|ValidateConfig", "Abort|AbortRun")
 End Function
 
 Public Sub AddSheetButtons(ws As Worksheet, defs As Variant)
@@ -781,76 +279,13 @@ Public Sub AddSheetButtons(ws As Worksheet, defs As Variant)
     x = 6
     For i = LBound(defs) To UBound(defs)
         p = Split(defs(i), "|")
-        Set b = ws.Buttons.Add(x, 4, 118, 26)
+        Set b = ws.Buttons.Add(x, 4, 128, 26)
         b.OnAction = p(1)
         b.Caption = p(0)
         b.Name = "btn_" & p(1)
         b.Placement = xlFreeFloating
-        x = x + 124
+        x = x + 134
     Next
-End Sub
-
-Private Sub WriteReadme()
-    Dim ws As Worksheet, t As Collection, i As Long, s As String
-    Set ws = GetSheet(SH_README)
-    ws.Cells.Clear
-    Set t = New Collection
-    t.Add "#BLOT Best-Execution Monitor - operator guide"
-    t.Add "Banco de Portugal: every deal must have quotes requested from at least 3 counterparties. This workbook checks it every business day and keeps the evidence."
-    t.Add ""
-    t.Add "#1. One-time setup"
-    t.Add "a) Excel > Options > Advanced > General: UNCHECK 'Ignore other applications that use Dynamic Data Exchange (DDE)'."
-    t.Add "b) Keep this file in a Trusted Location (or have IT sign it). Bloomberg Terminal logged in; Outlook open if e-mail is used."
-    t.Add "c) CONFIG sheet: fill the yellow cells - ARCHIVE_DIR (required), EXPORT_FOLDER (if used), ALERT_TO, SHOW_POPUPS=FALSE for unattended runs."
-    t.Add "d) DEALER_MAP sheet: one row per dealer alias -> legal entity (e.g. JPM, JPM LDN, JPMS -> JPMORGAN). Otherwise aliases count as different counterparties."
-    t.Add "e) Click 'Validate Config' and fix every FAIL line (CONFIG columns E:G)."
-    t.Add ""
-    t.Add "#2. Calibrate the export (TERMINAL mode)"
-    t.Add "a) Click 'Calibrate Export': it tries EXPORT_CANDIDATES (Export = 2<GO>, then 2nd item XLS) and saves the one that exports."
-    t.Add "   If none works: maximise the Bloomberg panel (same monitor and size as on the run days) and use Record Export below."
-    t.Add "b) Click 'Record Export', answer Yes (it opens BLOT 2 / BLOT -1), then do the export BY HAND exactly as usual"
-    t.Add "   (clicks, right-clicks, menu numbers + <GO>, Enter). Recording stops when the export appears in Excel."
-    t.Add "   It writes EXPORT_SEQ, BBG_WINDOW and (if needed) BBG_TITLE_PREFIX on CONFIG. Close the export workbook."
-    t.Add "c) Click 'Test Export': it runs TEST_EXPORT_RUNS (5) cycles. Accept EXPORT_SEQ only with 5/5 successes (see LOG)."
-    t.Add "d) Check the LOG line 'Header mapping': every role must point to the right export column. Put the exact export headers first in HDR_* on CONFIG."
-    t.Add "e) Pin DEALER_MODE (ROWS preferred) and set DATE_FORMAT_TEXT if the export has text dates (e.g. MM/DD/YYYY)."
-    t.Add "f) Compare 5-10 real deals by hand with the BLOT inquiry detail (DEALS column NDealers / Dealers)."
-    t.Add "g) If 'BLOT -1' means one CALENDAR day back, use KEYS:BLOT -{DAYS_BACK}<GO> in OPEN_SEQ so Monday covers Friday (DAYS_BACK = days to previous business day)."
-    t.Add ""
-    t.Add "#3. Daily operation"
-    t.Add "The workbook arms a daily run at RUN_AT when it is opened (keep it open, or let Windows Task Scheduler open it before RUN_AT)."
-    t.Add "Weekends and the holidays listed on CONFIG (column I) are skipped. During a TERMINAL run (about 15 s) do not touch keyboard or mouse; the screen must be unlocked."
-    t.Add "Buttons: Run Now (manual run), Import File (backfill old exports), Abort (reset a stuck run), Run Self-Tests (checks the counting logic)."
-    t.Add ""
-    t.Add "#4. Sheets"
-    t.Add "DASHBOARD  KPIs, status banner, distribution of counterparties per deal, deal lookups, exceptions, recent history."
-    t.Add "DEALS      latest run, one row per deal (TradeKey prefix RFQ:/TKT:/CMP:/ORD: shows how the deal was grouped)."
-    t.Add "HIST       audit trail, one row per (TradeDate, TradeKey); re-running a day updates rows, never duplicates. Column Source = archive file."
-    t.Add "HIST_DAILY one row per trade date (recomputed from HIST).   RAW = latest raw export.   LOG = every run, alert, timeout and error."
-    t.Add ""
-    t.Add "#5. What the alerts mean"
-    t.Add "'< 3'      fewer than MIN_Q distinct counterparties were asked on that deal. Investigate and document."
-    t.Add "'KEY?'     rows of one deal carry different ISINs or sides: the grouping is ambiguous. Check the export / HDR_* mapping."
-    t.Add "TIMEOUT    the export was not detected within TIMEOUT_S. Check the Terminal, EXPORT_SEQ and screen lock."
-    t.Add "Coverage gap   a business day has no data in HIST_DAILY. Backfill it with Import File (or check BLOT -1 semantics, step 2g)."
-    t.Add "No executed trades   the export was empty. Confirm that the desk did not trade that day."
-    t.Add ""
-    t.Add "#6. Limits of the control"
-    t.Add "Only trades in the BLOT are covered: voice / off-platform trades need a separate source."
-    t.Add "The dealer column must contain the counterparties ASKED, not the quotes received (that would create false alerts)."
-    t.Add "Open policy points: GROUP_LEVEL (RFQ or ORDER), holiday calendar, scheduled delivery of the BLOT view by Bloomberg (option A)."
-    For i = 1 To t.Count
-        s = CStr(t(i))
-        If Left$(s, 1) = "#" Then
-            ws.Cells(i + 1, 2).Value = Mid$(s, 2)
-            ws.Cells(i + 1, 2).Font.Bold = True
-            ws.Cells(i + 1, 2).Font.Size = IIf(i = 1, 15, 12)
-        ElseIf Len(s) > 0 Then
-            ws.Cells(i + 1, 2).Value = "'" & s
-        End If
-    Next
-    ws.Columns(1).ColumnWidth = 2
-    ws.Columns(2).ColumnWidth = 160
 End Sub
 
 '==========================================================================================
@@ -866,7 +301,7 @@ Public Sub ScheduleDaily()
     If gNextRun <= Now Then gNextRun = gNextRun + 1
     Application.OnTime gNextRun, ProcName("ScheduledRun")
     gSchedPending = True
-    WriteLog "Scheduler armed: next run " & Format$(gNextRun, "yyyy-mm-dd hh:nn:ss") & IIf(IsBusinessDay(gNextRun), "", " (non-business day: will be skipped)"), LV_INFO
+    WriteLog "Scheduler armed: next run " & Format$(gNextRun, "yyyy-mm-dd hh:nn:ss"), LV_INFO
     Exit Sub
 EH:
     Notify "ERROR in ScheduleDaily: " & Err.Description, LV_ERROR
@@ -896,10 +331,10 @@ End Sub
 Private Function BeginRun(ByVal kind As String) As Boolean
     If gBusy Then
         If Now > gDeadline + TimeSerial(0, 10, 0) Then
-            Notify "Previous " & gKind & " run looked stuck (deadline " & Format$(gDeadline, "hh:nn:ss") & "): state reset.", LV_WARN
+            Notify "Previous " & gKind & " run looked stuck: state reset.", LV_WARN
             CancelPending
         Else
-            Notify "A " & gKind & " run is already in progress; request ignored (use Abort to reset).", LV_WARN, True, True
+            Notify "A " & gKind & " run is already in progress (use Abort to reset).", LV_WARN, True, True
             Exit Function
         End If
     End If
@@ -917,7 +352,7 @@ End Sub
 Private Sub CancelPending()
     On Error Resume Next
     If gPollPending Then Application.OnTime gPollAt, ProcName("PollExport"), , False
-    If gCyclePending Then Application.OnTime gCycleAt, ProcName(gCycleProc), , False
+    If gCyclePending Then Application.OnTime gCycleAt, ProcName("StartTestCycle"), , False
     gPollPending = False: gCyclePending = False
 End Sub
 
@@ -931,38 +366,26 @@ Private Function ProcName(ByVal p As String) As String
     ProcName = "'" & ThisWorkbook.Name & "'!" & p
 End Function
 
-' Drives the source (TERMINAL steps) and arms the poll. False = could not start (already logged).
 Private Function StartAcquisition() As Boolean
     gT0 = Now: gDeadline = gT0 + TimeSerial(0, 0, TIMEOUT_S)
     gCandKey = "": gCandRows = -1: gLastErr = ""
     gKnown = SnapshotWorkbooks()
-    Select Case SOURCE_MODE
-        Case "TERMINAL"
-            gSince = gT0
-            If Len(EXPORT_SEQ) = 0 Then Notify "EXPORT_SEQ is empty: configure the export steps on CONFIG (Capture Click Point / Test Export).", LV_ERROR: Exit Function
-            If Not RunSteps(ExpandSeq(OPEN_SEQ, Date)) Then Notify "OPEN_SEQ failed: could not drive the Bloomberg Terminal.", LV_ERROR: Exit Function
-            If Not RunSteps(ExpandSeq(EXPORT_SEQ, Date)) Then Notify "EXPORT_SEQ failed.", LV_ERROR: Exit Function
-        Case "OUTLOOK"
-            gSince = Date
-        Case "FOLDER"
-            gSince = Date
-            If Len(EXPORT_FOLDER) = 0 Then Notify "EXPORT_FOLDER is empty (FOLDER mode).", LV_ERROR: Exit Function
-        Case Else
-            Notify "Invalid SOURCE_MODE: " & SOURCE_MODE, LV_ERROR: Exit Function
-    End Select
-    Application.StatusBar = "BLOT: waiting for export (" & SOURCE_MODE & ")..."
+    gSince = gT0
+    If Len(EXPORT_SEQ) = 0 Then Notify "EXPORT_SEQ is empty on CONFIG.", LV_ERROR: Exit Function
+    If Not RunSteps(ExpandSeq(OPEN_SEQ, Date)) Then Notify "OPEN_SEQ failed: could not drive the Bloomberg Terminal.", LV_ERROR: Exit Function
+    If Not RunSteps(ExpandSeq(EXPORT_SEQ, Date)) Then Notify "EXPORT_SEQ failed.", LV_ERROR: Exit Function
+    Application.StatusBar = "BLOT: waiting for the export..."
     SchedulePoll
     StartAcquisition = True
 End Function
 
 Private Sub OnAcquireTimeout()
     Dim msg As String
-    msg = "TIMEOUT: BLOT export not detected after " & TIMEOUT_S & "s (" & SOURCE_MODE & ")."
+    msg = "TIMEOUT: BLOT export not detected after " & TIMEOUT_S & "s (new Excel workbook" & _
+          IIf(Len(EXPORT_FOLDER) > 0, " or new file in " & EXPORT_FOLDER, "") & ")."
     If Len(gLastErr) > 0 Then msg = msg & " Last error: " & gLastErr
     If gKind = "TEST" Then
         TestCycleDone False, msg
-    ElseIf gKind = "CALIB" Then
-        CalibCycleDone False, "no export detected within the calibration wait"
     Else
         FinishRun
         Notify msg, LV_ALERT
@@ -972,8 +395,6 @@ End Sub
 Private Sub HandleExport(v As Variant, vRaw As Variant, ByVal label As String, ByVal srcWb As Object, ByVal srcFile As String)
     If gKind = "TEST" Then
         TestCycleDone True, label, v
-    ElseIf gKind = "CALIB" Then
-        CalibCycleDone True, label, v, srcFile
     Else
         ProcessData v, vRaw, label, srcWb, srcFile
         FinishRun
@@ -986,22 +407,18 @@ Private Sub TestCycleDone(ByVal ok As Boolean, ByVal detail As String, Optional 
     If ok Then
         gTestOK = gTestOK + 1
         If Not IsMissing(v) Then
-            Set res = ParseExport(v, LoadDealerMap(), PrevBusinessDay(Date))
-            detail = detail & " | parse: " & res("m") & " deal(s), " & res("nB") & " below " & MIN_Q & ", mode=" & res("mode") & _
-                     vbLf & "Header mapping: " & res("mapping")
-            If Len(res("warnings")) > 0 Then detail = detail & vbLf & "Data quality: " & res("warnings")
+            Set res = AnalyzeBlot(v, LoadDealerMap(), PrevBusinessDay(Date))
+            detail = detail & " | " & res("m") & " request(s), " & res("nFilled") & " filled | " & res("mapping")
         End If
     End If
-    Notify "TestExport cycle " & gTestI & "/" & gTestN & ": " & IIf(ok, "OK - export detected in ", "FAIL - ") & detail, IIf(ok, LV_INFO, LV_WARN), False, True
+    Notify "TestExport cycle " & gTestI & "/" & gTestN & ": " & IIf(ok, "OK - ", "FAIL - ") & detail, IIf(ok, LV_INFO, LV_WARN), False, True
     If gTestI < gTestN Then
-        gCycleAt = Now + TimeSerial(0, 0, 3): gCycleProc = "StartTestCycle"
-        Application.OnTime gCycleAt, ProcName(gCycleProc)
+        gCycleAt = Now + TimeSerial(0, 0, 3)
+        Application.OnTime gCycleAt, ProcName("StartTestCycle")
         gCyclePending = True
     Else
         FinishRun
-        Notify "TestExport finished: " & gTestOK & "/" & gTestN & " cycle(s) succeeded." & _
-               IIf(gTestOK = gTestN And gTestN >= 5, " EXPORT_SEQ can be accepted.", " Do NOT accept EXPORT_SEQ until 5/5 succeed."), _
-               IIf(gTestOK = gTestN, LV_INFO, LV_WARN), True, True
+        Notify "TestExport finished: " & gTestOK & "/" & gTestN & " cycle(s) succeeded.", IIf(gTestOK = gTestN, LV_INFO, LV_WARN), True, True
     End If
 End Sub
 
@@ -1009,23 +426,8 @@ End Sub
 '                                    SOURCES
 '==========================================================================================
 Private Function TryAcquire() As Boolean
-    Select Case SOURCE_MODE
-        Case "TERMINAL"
-            If TryNewWorkbooks() Then TryAcquire = True: Exit Function
-            If Len(EXPORT_FOLDER) > 0 Then
-                If TryFile(NewestFileSince(EXPORT_FOLDER, gSince), True) Then TryAcquire = True: Exit Function
-            End If
-            If gKind = "CALIB" Then
-                Dim fo As Variant
-                For Each fo In CalibFolders()
-                    If TryFile(NewestFileSince(CStr(fo), gSince), True) Then TryAcquire = True: Exit Function
-                Next
-            End If
-        Case "FOLDER"
-            TryAcquire = TryFile(NewestFileSince(EXPORT_FOLDER, gSince), True)
-        Case "OUTLOOK"
-            TryAcquire = TryFile(FetchOutlookAttachment(), False)
-    End Select
+    If TryNewWorkbooks() Then TryAcquire = True: Exit Function
+    If Len(EXPORT_FOLDER) > 0 Then TryAcquire = TryFile(NewestFileSince(EXPORT_FOLDER, gSince))
 End Function
 
 Private Function TryNewWorkbooks() As Boolean
@@ -1039,35 +441,28 @@ Private Function TryNewWorkbooks() As Boolean
                     If IsStable(k, blk("rows")) Then
                         gKnown = gKnown & Mid$(k, 2)
                         HandleExport blk("v"), blk("raw"), "workbook " & blk("label"), wb, ""
-                        If CLOSE_EXPORT Or gKind = "TEST" Then CloseExport wb, app
+                        CloseExport wb, app
                         TryNewWorkbooks = True
                     End If
-                    Exit Function                       ' found but still populating -> next poll
+                    Exit Function
                 ElseIf InStr(1, gWarned, k, vbTextCompare) = 0 Then
                     gWarned = gWarned & Mid$(k, 2)
-                    WriteLog "New workbook " & wb.Name & " ignored: no header row with a dealer column (HDR_DEALERS) in the first 40 rows.", LV_INFO
+                    WriteLog "New workbook " & wb.Name & " ignored: no BLOT header row.", LV_INFO
                 End If
             End If
         Next
     Next
 End Function
 
-Private Function TryFile(ByVal f As String, ByVal needStable As Boolean) As Boolean
+Private Function TryFile(ByVal f As String) As Boolean
     Dim wb As Workbook, blk As Object
     If Len(f) = 0 Then Exit Function
     If InStr(1, gKnown, "|" & f & "|", vbTextCompare) > 0 Then Exit Function
-    If needStable Then
-        If Not IsStable("F|" & f, FileLen(f)) Then Exit Function
-    End If
-    If IsCsvPath(f) Then
-        Set blk = CsvBlock(f)
-    Else
-        Set wb = Workbooks.Open(f, UpdateLinks:=0, ReadOnly:=True)
-        Set blk = FindBlockInWorkbook(wb)
-    End If
+    If Not IsStable("F|" & f, FileLen(f)) Then Exit Function
     gKnown = gKnown & f & "|"
+    Set blk = OpenExportFile(f, wb)
     If blk Is Nothing Then
-        Notify "File " & f & " ignored: no header row with a dealer column (HDR_DEALERS).", LV_WARN
+        Notify "File " & f & " ignored: no BLOT header row.", LV_WARN
     Else
         HandleExport blk("v"), blk("raw"), "file " & f, Nothing, f
         TryFile = True
@@ -1075,46 +470,33 @@ Private Function TryFile(ByVal f As String, ByVal needStable As Boolean) As Bool
     If Not wb Is Nothing Then wb.Close False
 End Function
 
-Private Function FetchOutlookAttachment() As String
-    Dim ol As Object, fld As Object, its As Object, it As Object, att As Object, p As String, fn As String
-    On Error GoTo Done
-    Set ol = CreateObject("Outlook.Application")
-    Set fld = OutlookFolder(ol, OUTLOOK_FOLDER)
-    If fld Is Nothing Then gLastErr = "Outlook folder '" & OUTLOOK_FOLDER & "' not found": Exit Function
-    Set its = fld.Items
-    its.Sort "[ReceivedTime]", True
-    Set it = its.GetFirst
-    Do While Not it Is Nothing
-        If it.Class = 43 Then
-            If it.ReceivedTime < gSince Then Exit Do
-            If InStr(1, it.Subject, OUTLOOK_SUBJECT, vbTextCompare) > 0 Then
-                If InStr(1, gKnown, "|" & it.EntryID & "|", vbTextCompare) = 0 Then
-                    For Each att In it.Attachments
-                        fn = LCase$(att.FileName)
-                        If fn Like "*.xls*" Or fn Like "*.csv" Then
-                            p = Environ$("TEMP") & "\BLOT_" & Format$(Now, "yyyymmdd_hhnnss") & "_" & att.FileName
-                            att.SaveAsFile p
-                            gKnown = gKnown & it.EntryID & "|"
-                            FetchOutlookAttachment = p
-                            Exit Function
-                        End If
-                    Next
-                End If
-            End If
-        End If
-        Set it = its.GetNext
-    Loop
-Done:
-    If Err.Number <> 0 Then gLastErr = "Outlook: " & Err.Description
+' Opens an export file (CSV as text, Excel / Bloomberg XLS through Excel) and finds the BLOT block
+Private Function OpenExportFile(ByVal f As String, ByRef wb As Workbook) As Object
+    Dim da As Boolean, a As Variant, blk As Variant, d As Object
+    If LCase$(Right$(f, 4)) = ".csv" Or LCase$(Right$(f, 4)) = ".txt" Then
+        a = ParseCsvText(ReadTextFile(f), "AUTO")
+        blk = FindBlockInArray(a)
+        If IsEmpty(blk) Then Exit Function
+        Set d = NewDict()
+        d("v") = blk: d("raw") = blk: d("rows") = UBound(blk, 1): d("label") = Dir$(f)
+        Set OpenExportFile = d
+    Else
+        da = Application.DisplayAlerts: Application.DisplayAlerts = False   ' Bloomberg XLS: "format and extension" prompt
+        Set wb = Workbooks.Open(f, UpdateLinks:=0, ReadOnly:=True)
+        Application.DisplayAlerts = da
+        Set OpenExportFile = FindBlockInWorkbook(wb)
+    End If
 End Function
 
+' Newest *.xls* / *.csv modified since 'since' (this workbook, Excel temp files and archive copies excluded)
 Private Function NewestFileSince(ByVal folder As String, ByVal since As Date) As String
     Dim f As String, best As String, bt As Date, ft As Date, pat As Variant
     If Right$(folder, 1) <> "\" Then folder = folder & "\"
     For Each pat In Array("*.xls*", "*.csv")
         f = Dir$(folder & pat)
         Do While Len(f) > 0
-            If Left$(f, 2) <> "~$" Then
+            If Left$(f, 2) <> "~$" And StrComp(folder & f, ThisWorkbook.FullName, vbTextCompare) <> 0 _
+               And Not (f Like "BLOT_########_########_######*") Then
                 ft = FileDateTime(folder & f)
                 If ft >= since And ft > bt Then bt = ft: best = folder & f
             End If
@@ -1132,7 +514,6 @@ Private Sub CloseExport(ByVal wb As Object, ByVal app As Object)
     End If
 End Sub
 
-' All running Excel instances (Bloomberg export often opens a separate instance)
 Private Function AllExcelApps() As Collection
     Dim col As New Collection, seen As Object, hMain As LongPtr, hDesk As LongPtr, h7 As LongPtr
     Dim w As Object, iid As GUID_T, app As Object
@@ -1174,51 +555,31 @@ Private Function IsStable(ByVal key As String, ByVal n As Long) As Boolean
     If key = gCandKey And n = gCandRows Then IsStable = True Else gCandKey = key: gCandRows = n
 End Function
 
-Private Function IsCsvPath(ByVal f As String) As Boolean
-    IsCsvPath = (LCase$(Right$(f, 4)) = ".csv" Or LCase$(Right$(f, 4)) = ".txt")
-End Function
-
-' CSV is read as TEXT (no Excel conversion): avoids the PT-locale date/number misparse of Workbooks.Open
-Private Function CsvBlock(ByVal f As String) As Object
-    Dim a As Variant, blk As Variant, d As Object
-    a = ParseCsvText(ReadTextFile(f), CSV_DELIM)
-    blk = FindBlockInArray(a)
-    If IsEmpty(blk) Then Exit Function
-    Set d = NewDict()
-    d("v") = blk: d("raw") = blk: d("rows") = UBound(blk, 1): d("label") = Dir$(f)
-    Set CsvBlock = d
-End Function
-
 '==========================================================================================
-'                                    TERMINAL DRIVER
+'                                    TERMINAL DRIVER (KEYS via DDE, SEND, WAIT)
 '==========================================================================================
 Public Function ExpandSeq(ByVal seq As String, ByVal refDate As Date) As String
     ExpandSeq = Replace(seq, "{DAYS_BACK}", CStr(DaysBack(refDate)), , , vbTextCompare)
 End Function
 
-' "" if the step sequence is syntactically valid, else the problem
 Public Function ValidateSteps(ByVal seq As String) As String
-    Dim st As Variant, s As String, tok As String, arg As String, p As Long, xy() As String
+    Dim st As Variant, s As String, tok As String, arg As String, p As Long
     For Each st In Split(seq, "|")
         s = Trim$(CStr(st))
         If Len(s) > 0 Then
             p = InStr(1, s, ":")
-            If p = 0 Then ValidateSteps = "Bad step '" & s & "' (expected TOKEN:arg).": Exit Function
+            If p = 0 Then ValidateSteps = "Bad step '" & s & "' (expected KEYS:..., SEND:... or WAIT:s).": Exit Function
             tok = UCase$(Left$(s, p - 1)): arg = Mid$(s, p + 1)
             Select Case tok
                 Case "KEYS", "SEND"
                     If Len(arg) = 0 Then ValidateSteps = "Empty " & tok & " step.": Exit Function
                     If tok = "KEYS" And (UCase$(Trim$(arg)) Like "[A-Z]<GO>" Or InStr(1, arg, "<N>", vbTextCompare) > 0) Then
-                        ValidateSteps = "'" & s & "' looks like an unfilled placeholder: a single letter + <GO> runs a Bloomberg function (N = News). Use Record Export.": Exit Function
+                        ValidateSteps = "'" & s & "' looks like a placeholder (a letter + <GO> runs a Bloomberg function, N = News).": Exit Function
                     End If
-                Case "CLICK", "RCLICK", "DCLICK"
-                    xy = Split(arg, ",")
-                    If UBound(xy) <> 1 Then ValidateSteps = "Bad " & s & " (expected " & tok & ":x,y).": Exit Function
-                    If Not IsPlainNumber(Replace(Trim$(xy(0)), "-", "")) Or Not IsPlainNumber(Replace(Trim$(xy(1)), "-", "")) Then ValidateSteps = "Bad coordinates in " & s & ".": Exit Function
                 Case "WAIT"
                     If Not IsPlainNumber(arg) Then ValidateSteps = "Bad " & s & " (seconds, '.' decimal).": Exit Function
                 Case Else
-                    ValidateSteps = "Unknown step '" & tok & "' in '" & s & "'.": Exit Function
+                    ValidateSteps = "Unknown step '" & tok & "' (v5 supports KEYS, SEND, WAIT).": Exit Function
             End Select
         End If
     Next
@@ -1228,7 +589,6 @@ Private Function RunSteps(ByVal seq As String) As Boolean
     Dim st As Variant, s As String, tok As String, arg As String, p As Long, e As String
     e = ValidateSteps(seq)
     If Len(e) > 0 Then Notify "Step sequence rejected: " & e, LV_ERROR: Exit Function
-    gWinChecked = False
     For Each st In Split(seq, "|")
         s = Trim$(CStr(st))
         If Len(s) > 0 Then
@@ -1236,12 +596,10 @@ Private Function RunSteps(ByVal seq As String) As Boolean
             tok = UCase$(Left$(s, p - 1)): arg = Mid$(s, p + 1)
             Select Case tok
                 Case "KEYS"
-                    If Not BbgType(arg) Then Notify "Step failed: " & s & " (Bloomberg window '" & BBG_TITLE_PREFIX & "' not reachable).", LV_ERROR: Exit Function
+                    If Not BbgType(arg) Then Notify "Step failed: " & s & " (no DDE link and no Bloomberg window).", LV_ERROR: Exit Function
                 Case "SEND"
-                    If Not BbgFocusUnlessOwn() Then Notify "Step failed: " & s & " (Bloomberg window '" & BBG_TITLE_PREFIX & "' not found: use List Windows / Record Export).", LV_ERROR: Exit Function
+                    If Not BbgFocus() Then Notify "Step failed: " & s & " (window '" & BBG_TITLE_PREFIX & "' not found).", LV_ERROR: Exit Function
                     SendKeys arg, True
-                Case "CLICK", "RCLICK", "DCLICK"
-                    If Not BbgClick(arg, tok) Then Notify "Step failed: " & s & " (Bloomberg window '" & BBG_TITLE_PREFIX & "' not found: use List Windows / Record Export).", LV_ERROR: Exit Function
                 Case "WAIT"
                     WaitSec Val(arg)
             End Select
@@ -1272,107 +630,25 @@ Fail:
     BbgType = False
 End Function
 
-Private Function BbgClick(ByVal arg As String, ByVal kind As String) As Boolean
-    Dim h As LongPtr, rc As RECT_T, xy() As String
-    xy = Split(arg, ",")
-    If UBound(xy) <> 1 Then Exit Function
-    If Not BbgFocusUnlessOwn() Then Exit Function
-    h = BbgHwnd()
-    If Not gWinChecked Then CheckBbgWindow h: gWinChecked = True
-    GetWindowRect h, rc
-    SetCursorPos rc.Left + CLng(Val(xy(0))), rc.Top + CLng(Val(xy(1)))
-    WaitSec 0.2
-    Select Case kind
-        Case "CLICK":  MouseBtn MOUSE_LDOWN, MOUSE_LUP
-        Case "RCLICK": MouseBtn MOUSE_RDOWN, MOUSE_RUP
-        Case "DCLICK": MouseBtn MOUSE_LDOWN, MOUSE_LUP: WaitSec 0.08: MouseBtn MOUSE_LDOWN, MOUSE_LUP
-    End Select
-    BbgClick = True
-End Function
-
-Private Sub MouseBtn(ByVal dn As Long, ByVal up As Long)
-    mouse_event dn, 0, 0, 0, 0
-    WaitSec 0.05
-    mouse_event up, 0, 0, 0, 0
-End Sub
-
-' Bloomberg panel window: 1) title starts with BBG_TITLE_PREFIX; 2) else the visible window of a
-' Bloomberg process (BBG_PROCESS) whose title starts with the panel number ("1-"), else the largest one
-Public Function BbgHwnd() As LongPtr
-    Dim h As LongPtr, t As String, rc As RECT_T, area As Double, best As LongPtr, bestA As Double, pn As String
-    If Len(BBG_TITLE_PREFIX) > 0 Then
-        h = FindWindowEx(0, 0, vbNullString, vbNullString)
-        Do While h <> 0
-            If IsWindowVisible(h) <> 0 Then
-                t = WindowTitle(h)
-                If Len(t) > 0 Then
-                    If UCase$(Left$(t, Len(BBG_TITLE_PREFIX))) = UCase$(BBG_TITLE_PREFIX) Then BbgHwnd = h: Exit Function
-                End If
-            End If
-            h = FindWindowEx(0, h, vbNullString, vbNullString)
-        Loop
-    End If
-    If Len(BBG_PANEL) > 6 Then pn = Mid$(BBG_PANEL, 6, Len(BBG_PANEL) - 6) & "-" Else pn = "1-"
+Private Function BbgHwnd() As LongPtr
+    Dim h As LongPtr, s As String, l As Long
+    If Len(BBG_TITLE_PREFIX) = 0 Then Exit Function
     h = FindWindowEx(0, 0, vbNullString, vbNullString)
     Do While h <> 0
         If IsWindowVisible(h) <> 0 Then
-            If IsBloombergWindow(h) Then
-                t = WindowTitle(h)
-                If Len(t) > 0 Then
-                    If Left$(t, Len(pn)) = pn Then BbgHwnd = h: Exit Function
-                    GetWindowRect h, rc
-                    area = CDbl(rc.Right - rc.Left) * CDbl(rc.Bottom - rc.Top)
-                    If area > bestA Then bestA = area: best = h
-                End If
+            s = String$(260, vbNullChar): l = GetWindowText(h, s, 260)
+            If l > 0 Then
+                If UCase$(Left$(Left$(s, l), Len(BBG_TITLE_PREFIX))) = UCase$(BBG_TITLE_PREFIX) Then BbgHwnd = h: Exit Function
             End If
         End If
         h = FindWindowEx(0, h, vbNullString, vbNullString)
     Loop
-    BbgHwnd = best
-End Function
-
-Private Function IsBloombergWindow(ByVal h As LongPtr) As Boolean
-    IsBloombergWindow = IsBloombergExe(ProcessExe(WindowPid(h)))
-End Function
-
-Public Function IsBloombergExe(ByVal exe As String) As Boolean
-    Dim a As Variant, t As String
-    If Len(exe) = 0 Then Exit Function
-    For Each a In Split(LCase$(BBG_PROCESS), "|")
-        t = Trim$(CStr(a))
-        If Len(t) > 0 Then
-            If LCase$(exe) Like t Then IsBloombergExe = True: Exit Function
-        End If
-    Next
-End Function
-
-' Executable file name of a process (lowercase), cached
-Private Function ProcessExe(ByVal pid As Long) As String
-    Dim hp As LongPtr, buf As String, n As Long, p As Long
-    If pid = 0 Then Exit Function
-    If gExeCache Is Nothing Then Set gExeCache = NewDict()
-    If gExeCache.Exists(pid) Then ProcessExe = gExeCache(pid): Exit Function
-    hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
-    If hp <> 0 Then
-        buf = String$(1024, vbNullChar): n = 1024
-        If QueryFullProcessImageName(hp, 0, buf, n) <> 0 Then
-            buf = Left$(buf, n)
-            p = InStrRev(buf, "\")
-            ProcessExe = LCase$(Mid$(buf, p + 1))
-        End If
-        CloseHandle hp
-    End If
-    gExeCache(pid) = ProcessExe
 End Function
 
 Private Function BbgFocus() As Boolean
-    Dim h As LongPtr, s As String, l As Long
+    Dim h As LongPtr
     h = BbgHwnd(): If h = 0 Then Exit Function
     If IsIconic(h) <> 0 Then ShowWindow h, SW_RESTORE
-    s = String$(260, vbNullChar): l = GetWindowText(h, s, 260)
-    On Error Resume Next
-    AppActivate Left$(s, l)
-    On Error GoTo 0
     SetForegroundWindow h
     WaitSec 0.5
     BbgFocus = True
@@ -1390,8 +666,6 @@ End Function
 '==========================================================================================
 '                                    READING EXPORTS
 '==========================================================================================
-' First sheet with a header row (first 40 rows, >= 3 cells, contains a dealer alias).
-' Returns Dictionary: v (Value2 block, parsed), raw (Value block, for RAW), rows, label
 Private Function FindBlockInWorkbook(ByVal wb As Object) As Object
     Dim ws As Object, ur As Object, a As Variant, r As Long, lc As Long, d As Object
     If wb Is ThisWorkbook Then Exit Function
@@ -1422,6 +696,7 @@ Public Function FindBlockInArray(a As Variant) As Variant
     If r > 0 Then FindBlockInArray = SliceBlock(a, r, lc)
 End Function
 
+' Header row = first of 40 rows with a dealer column and an ID or ISIN column
 Private Function FindHeaderRow(a As Variant, ByRef lastC As Long) As Long
     Dim r As Long, c As Long, lc As Long, rMax As Long, hdr() As Variant
     rMax = UBound(a, 1): If rMax > 40 Then rMax = 40
@@ -1433,7 +708,9 @@ Private Function FindHeaderRow(a As Variant, ByRef lastC As Long) As Long
         If lc >= 3 Then
             ReDim hdr(1 To 1, 1 To lc)
             For c = 1 To lc: hdr(1, c) = a(r, c): Next
-            If HeaderIndex(hdr, HDR_DEALERS) > 0 Then FindHeaderRow = r: lastC = lc: Exit Function
+            If HeaderIndex(hdr, HDR_DEALER) > 0 And (HeaderIndex(hdr, HDR_ID) > 0 Or HeaderIndex(hdr, HDR_ISIN) > 0) Then
+                FindHeaderRow = r: lastC = lc: Exit Function
+            End If
         End If
     Next
 End Function
@@ -1444,13 +721,12 @@ Private Function SliceBlock(a As Variant, ByVal r0 As Long, ByVal nc As Long) As
     ReDim o(1 To n, 1 To nc)
     For i = 1 To n
         For j = 1 To nc
-            o(i, j) = a(r0 + i - 1, j)
+            If j <= UBound(a, 2) Then o(i, j) = a(r0 + i - 1, j)
         Next
     Next
     SliceBlock = o
 End Function
 
-' Reads a text file: UTF-8 (BOM or valid), UTF-16 LE (BOM) or Windows-1252
 Public Function ReadTextFile(ByVal p As String) As String
     Dim st As Object, b() As Byte, cs As String, s As String, n As Long
     Set st = CreateObject("ADODB.Stream")
@@ -1507,7 +783,7 @@ Private Function LooksUtf8(b() As Byte) As Boolean
 End Function
 
 Public Function CsvDelimiter(ByVal txt As String, ByVal cfg As String) As String
-    Dim lines As Variant, i As Long, c As Long, cand As Variant, best As String, bestN As Long, mx As Long, n As Long
+    Dim lines As Variant, i As Long, cand As Variant, best As String, bestN As Long, mx As Long, n As Long
     Select Case UCase$(Trim$(cfg))
         Case ";": CsvDelimiter = ";": Exit Function
         Case ",": CsvDelimiter = ",": Exit Function
@@ -1516,7 +792,7 @@ Public Function CsvDelimiter(ByVal txt As String, ByVal cfg As String) As String
     txt = Replace(Replace(txt, vbCrLf, vbLf), vbCr, vbLf)
     lines = Split(txt, vbLf, 21)
     best = ",": bestN = 0
-    For Each cand In Array(";", ",", vbTab)
+    For Each cand In Array(vbTab, ";", ",")
         mx = 0
         For i = LBound(lines) To Application.WorksheetFunction.Min(UBound(lines), LBound(lines) + 19)
             n = Len(lines(i)) - Len(Replace(lines(i), cand, ""))
@@ -1527,7 +803,6 @@ Public Function CsvDelimiter(ByVal txt As String, ByVal cfg As String) As String
     CsvDelimiter = best
 End Function
 
-' RFC-4180 style parser: quoted fields, "" escapes, line breaks inside quotes. All values are text.
 Public Function ParseCsvText(ByVal txt As String, ByVal delimCfg As String) As Variant
     Dim d As String, n As Long, i As Long, c As String, inQ As Boolean, fld As String
     Dim rowF() As String, nf As Long, rows As Collection, maxC As Long, a() As Variant, r As Long, j As Long, rw As Variant
@@ -1563,7 +838,6 @@ Public Function ParseCsvText(ByVal txt As String, ByVal delimCfg As String) As V
     If nf > 0 Or Len(fld) > 0 Then PushField rowF, nf, fld: PushRow rows, rowF, nf, maxC
     If rows.Count = 0 Then Exit Function
     ReDim a(1 To rows.Count, 1 To maxC)
-    r = 0
     For Each rw In rows
         r = r + 1
         For j = 1 To maxC
@@ -1588,274 +862,298 @@ Private Sub PushRow(rows As Collection, rowF() As String, ByRef nf As Long, ByRe
 End Sub
 
 '==========================================================================================
-'                                    PARSING CORE (pure: array in, result out)
+'                                    ANALYSIS CORE (pure: array in, result out)
 '==========================================================================================
-' v       : 2-D array, row 1 = header (1-based)
-' dmap    : normalized alias -> normalized legal entity
-' defTD   : trade date used when a deal has no parseable trade date
-' Returns a Dictionary: ok, err, m, deals (m x NCOL), mode, mapping, warnings, nB, nBad,
-'   nDropped, dropped, nSkipped, nDateFallback, unmapped, keykinds, minTD, maxTD
-' Deal columns: 1 TradeDate | 2 TradeKey | 3 Security | 4 Side | 5 Qty | 6 NDealers | 7 Status
-'               8 LoadedAt (wrapper) | 9 Dealers (sorted, ';') | 10 Source (wrapper)
-Public Function ParseExport(v As Variant, dmap As Object, ByVal defTD As Date) As Object
-    Dim res As Object, hdr() As Variant, n As Long, nc As Long, i As Long, j As Long
-    Dim cDl As Long, cRfq As Long, cID As Long, cOrd As Long, cSec As Long, cDt As Long
-    Dim cSide As Long, cQty As Long, cSt As Long, cTime As Long, cTrd As Long
-    Dim isOrd As Boolean, tktOK As Boolean, rk() As String, lastKey As String, k As String, s As String
-    Dim mode As String, live As Object, secU As Object, sideU As Object, secR As Object, sideR As Object
-    Dim qtyR As Object, dtR As Object, dset As Object, cnt As Object, bad As Object, perKey As Object
-    Dim ents As Object, unm As Object, kinds As Object, kk As Variant, out() As Variant
-    Dim nNum As Long, nTxt As Long, multi As Boolean, nSkip As Long, nFb As Long, m As Long, r As Long
-    Dim nB As Long, nBad As Long, nDrop As Long, dropped As String, warn As String, x As Long, d As Date
-    Dim minTD As Date, maxTD As Date, nCmp As Long
+' v = block, row 1 = header. Returns a Dictionary:
+'   ok, err, mapping, warnings, m (units), units (m x UCOLS), nLegs, legs (nLegs x QCOLS),
+'   nRequests, nFilled, nBreach, nLow, nKey, nQuotedLow, statuses, unmapped, minTD, maxTD
+' Unit columns: 1 TradeDate | 2 Key | 3 Security | 4 ISIN | 5 Side | 6 Qty | 7 Requests | 8 Asked
+'   9 Quoted | 10 Filled | 11 Winner | 12 FillPrice | 13 Check | 14 Dealers | 15 LoadedAt | 16 Source
+' Leg columns: 1 TradeDate | 2 Key | 3 Request | 4 Security | 5 ISIN | 6 Side | 7 Qty | 8 BrkrName
+'   9 Dealer (normalized) | 10 Status | 11 Price | 12 Quoted | 13 Filled
+Public Function AnalyzeBlot(v As Variant, dmap As Object, ByVal defTD As Date) As Object
+    Dim res As Object, hdr() As Variant, n As Long, nc As Long, i As Long, j As Long, u As Long, m As Long
+    Dim cDl As Long, cID As Long, cSec As Long, cIsin As Long, cSide As Long, cSt As Long, cQty As Long, cPx As Long, cDt As Long
+    Dim idx As Object, inqIsin As Object, inqSide As Object, inqDate As Object, badInq As Object, reqs As Object
+    Dim bondRows As Object, bondInq As Object, stSeen As Object, unm As Object, ents As Object, kk As Variant
+    Dim uDate() As Date, uKey() As String, uSec() As String, uIsin() As String, uSide() As String, uQty() As Variant
+    Dim uInq() As Object, uAsk() As Object, uQuo() As Object, uFill() As Boolean, uWin() As String, uPx() As Variant
+    Dim legs() As Variant, nLegs As Long, d As Date, dlr As String, nm As String, st As String, px As Double
+    Dim isin As String, sec As String, sideU As String, qty As String, inq As String, uk As String, bk As String
+    Dim isQ As Boolean, isF As Boolean, nNoDl As Long, nFb As Long, warn As String, s As String
+    Dim out() As Variant, ord() As Long, rk() As Long, t As Long, chk As String, bad As Boolean
+    Dim nFilled As Long, nBreach As Long, nLow As Long, nKey As Long, nQLow As Long, nSusp As Long
+    Dim minTD As Date, maxTD As Date
 
     Set res = NewDict()
-    res("ok") = False: res("err") = "": res("m") = 0: res("deals") = Empty: res("mode") = ""
-    res("mapping") = "": res("warnings") = "": res("nB") = 0: res("nBad") = 0: res("nDropped") = 0
-    res("dropped") = "": res("nSkipped") = 0: res("nDateFallback") = 0: res("unmapped") = ""
-    res("keykinds") = "": res("minTD") = 0: res("maxTD") = 0
+    res("ok") = False: res("err") = "": res("mapping") = "": res("warnings") = "": res("m") = 0
+    res("units") = Empty: res("nLegs") = 0: res("legs") = Empty: res("nRequests") = 0
+    res("nFilled") = 0: res("nBreach") = 0: res("nLow") = 0: res("nKey") = 0: res("nQuotedLow") = 0
+    res("statuses") = "": res("unmapped") = "": res("minTD") = 0: res("maxTD") = 0
     If Not IsArray(v) Then res("err") = "No data.": GoTo Done
     n = UBound(v, 1): nc = UBound(v, 2)
     ReDim hdr(1 To 1, 1 To nc)
     For j = 1 To nc: hdr(1, j) = v(1, j): Next
 
-    '--- header mapping ---
-    cDl = HeaderIndex(hdr, HDR_DEALERS)
-    cRfq = HeaderIndex(hdr, HDR_RFQ):     cID = HeaderIndex(hdr, HDR_ID)
-    cOrd = HeaderIndex(hdr, HDR_ORDER):   cSec = HeaderIndex(hdr, HDR_SEC)
-    cDt = HeaderIndex(hdr, HDR_DATE):     cSide = HeaderIndex(hdr, HDR_SIDE)
-    cQty = HeaderIndex(hdr, HDR_QTY):     cSt = HeaderIndex(hdr, HDR_STATUS)
-    cTime = HeaderIndex(hdr, HDR_TIME):   cTrd = HeaderIndex(hdr, HDR_TRADER)
-    isOrd = (GROUP_LEVEL = "ORDER")
-    res("mapping") = MapDesc(hdr, Array("DEALERS", cDl, "RFQ", cRfq, "ORDER", cOrd, "TICKET", cID, "SECURITY", cSec, _
-                     "DATE", cDt, "SIDE", cSide, "QTY", cQty, "STATUS", cSt, "TIME", cTime, "TRADER", cTrd))
-    warn = Collisions(Array("DEALERS", cDl, "RFQ", cRfq, "ORDER", cOrd, "TICKET", cID, "SECURITY", cSec, _
-                     "DATE", cDt, "SIDE", cSide, "QTY", cQty, "STATUS", cSt, "TIME", cTime, "TRADER", cTrd))
-    If cDl = 0 Then res("err") = "Dealer column not found (HDR_DEALERS).": GoTo Done
-    If isOrd And cOrd = 0 Then warn = warn & "GROUP_LEVEL=ORDER but no order column (HDR_ORDER): RFQ level used. "
-    If Not isOrd Then cOrd = 0
+    cDl = HeaderIndex(hdr, HDR_DEALER):   cID = HeaderIndex(hdr, HDR_ID)
+    cSec = HeaderIndex(hdr, HDR_SECURITY): cIsin = HeaderIndex(hdr, HDR_ISIN)
+    cSide = HeaderIndex(hdr, HDR_SIDE):   cSt = HeaderIndex(hdr, HDR_STATUS)
+    cQty = HeaderIndex(hdr, HDR_QTY):     cPx = HeaderIndex(hdr, HDR_PRICE)
+    cDt = HeaderIndex(hdr, HDR_DATE)
+    res("mapping") = "Columns: " & MapDesc(hdr, Array("DEALER", cDl, "ID", cID, "SECURITY", cSec, "ISIN", cIsin, "SIDE", cSide, _
+                     "STATUS", cSt, "QTY", cQty, "PRICE", cPx, "DATE", cDt))
+    If cDl = 0 Then res("err") = "Dealer column not found (HDR_DEALER).": GoTo Done
+    If cID = 0 And cIsin = 0 Then res("err") = "Neither an ID nor an ISIN column found (HDR_ID / HDR_ISIN).": GoTo Done
+    If cID = 0 Then warn = warn & "No ID column: requests grouped by trade date | ISIN | side | qty. "
+    If cSt = 0 Then warn = warn & "No status column: no request can be recognised as filled. "
+    If cPx = 0 Then warn = warn & "No price column: 'quoted' cannot be measured. "
 
-    '--- 1) ticket usable only if every dealer row without an RFQ/order id carries it ---
-    tktOK = (cID > 0)
-    If tktOK Then
-        For i = 2 To n
-            If Len(CellS(v, i, cDl)) > 0 And Not IsChildRow(v, i, cOrd, cRfq, cID, cSec) Then
-                If Len(CellS(v, i, cOrd)) + Len(CellS(v, i, cRfq)) + Len(CellS(v, i, cID)) = 0 Then tktOK = False: Exit For
-            End If
-        Next
-        If Not tktOK Then warn = warn & "Ticket column '" & NormH(hdr(1, cID)) & "' is blank on some dealer rows (ticket on the winning dealer only?): not used as key. "
-    End If
-
-    '--- 2) trade key per row; child rows (no RFQ/order/ticket/security) inherit the previous key ---
-    ReDim rk(1 To n)
-    For i = 2 To n
-        If IsChildRow(v, i, cOrd, cRfq, cID, cSec) Then
-            If Len(CellS(v, i, cDl)) > 0 Then
-                If Len(lastKey) = 0 Then nSkip = nSkip + 1 Else rk(i) = lastKey
-            End If
-        Else
-            k = MakeTradeKey(v, i, cOrd, cRfq, IIf(tktOK, cID, 0), cDt, cSec, cSide, cQty, cTime, cTrd)
-            rk(i) = k: lastKey = k
-        End If
-    Next
-
-    '--- 3) counting mode ---
-    mode = DEALER_MODE
-    If mode <> "ROWS" And mode <> "LIST" And mode <> "COUNT" Then
-        Set perKey = NewDict()
-        For i = 2 To n
-            If Len(rk(i)) > 0 Then
-                s = CellS(v, i, cDl)
-                If Len(s) > 0 Then
-                    If IsPlainNumber(s) Then nNum = nNum + 1 Else nTxt = nTxt + 1
-                    perKey(rk(i)) = perKey(rk(i)) + 1
-                    If perKey(rk(i)) > 1 Then multi = True
-                End If
-            End If
-        Next
-        If nNum > 0 And nNum >= nTxt Then
-            mode = "COUNT"
-        ElseIf multi Or nTxt = 0 Then
-            mode = "ROWS"
-        Else
-            mode = "LIST"
-        End If
-    End If
-    res("mode") = mode
-
-    '--- 4) aggregate per key ---
-    Set live = NewDict(): Set secU = NewDict(): Set sideU = NewDict(): Set secR = NewDict()
-    Set sideR = NewDict(): Set qtyR = NewDict(): Set dtR = NewDict(): Set dset = NewDict()
-    Set cnt = NewDict(): Set bad = NewDict(): Set unm = NewDict(): Set kinds = NewDict()
-    Set ents = NewDict()
+    Set idx = NewDict(): Set inqIsin = NewDict(): Set inqSide = NewDict(): Set inqDate = NewDict()
+    Set badInq = NewDict(): Set reqs = NewDict(): Set bondRows = NewDict(): Set bondInq = NewDict()
+    Set stSeen = NewDict(): Set unm = NewDict(): Set ents = NewDict()
     For Each kk In dmap.Keys: ents(dmap(kk)) = 1: Next
+    ReDim uDate(1 To n): ReDim uKey(1 To n): ReDim uSec(1 To n): ReDim uIsin(1 To n): ReDim uSide(1 To n)
+    ReDim uQty(1 To n): ReDim uInq(1 To n): ReDim uAsk(1 To n): ReDim uQuo(1 To n): ReDim uFill(1 To n)
+    ReDim uWin(1 To n): ReDim uPx(1 To n): ReDim legs(1 To n, 1 To QCOLS)
+
     For i = 2 To n
-        k = rk(i)
-        If Len(k) > 0 Then
-            If Not live.Exists(k) Then live.Add k, False: cnt.Add k, 0: dset.Add k, NewDict()
-            ' a deal is live if ANY row is not cancelled/rejected (dealer-level Expired/Passed = still asked)
-            If Not IsExcluded(CellS(v, i, cSt)) Then live(k) = True
-            ' integrity: one ISIN and one side per key
-            s = CellS(v, i, cSec)
-            If Len(s) > 0 Then
-                If Not secU.Exists(k) Then
-                    secU(k) = UCase$(s): secR(k) = s
-                ElseIf secU(k) <> UCase$(s) Then
-                    bad(k) = 1
-                End If
-            End If
-            s = CellS(v, i, cSide)
-            If Len(s) > 0 Then
-                If Not sideU.Exists(k) Then
-                    sideU(k) = UCase$(s): sideR(k) = s
-                ElseIf sideU(k) <> UCase$(s) Then
-                    bad(k) = 1
-                End If
-            End If
-            If Not qtyR.Exists(k) Then
-                s = CellS(v, i, cQty)
-                If Len(s) > 0 Then qtyR(k) = s
-            End If
-            If Not dtR.Exists(k) And cDt > 0 Then
-                If Len(CellS(v, i, cDt)) > 0 Then dtR.Add k, v(i, cDt)
-            End If
-            ' distinct counterparties, normalized to legal entity
-            s = CellS(v, i, cDl)
-            Select Case mode
-                Case "COUNT"
-                    If IsPlainNumber(s) Then
-                        x = Fix(Val(s))
-                        If x > cnt(k) Then cnt(k) = x
-                    End If
-                Case Else
-                    AddDealers dset(k), s, dmap, ents, unm, (mode = "LIST")
-                    cnt(k) = dset(k).Count
-            End Select
+        dlr = CellS(v, i, cDl)
+        If Len(dlr) = 0 Then
+            If Len(CellS(v, i, cID)) + Len(CellS(v, i, cIsin)) + Len(CellS(v, i, cSec)) > 0 Then nNoDl = nNoDl + 1
+            GoTo NextRow
         End If
-    Next
-
-    '--- 5) output ---
-    For Each kk In live.Keys
-        If live(kk) Then
-            m = m + 1
+        If cDt > 0 Then
+            If Not ParseDateCell(v(i, cDt), DATE_FORMAT_TEXT, d) Then d = defTD: nFb = nFb + 1
         Else
-            nDrop = nDrop + 1
-            If nDrop <= 50 Then dropped = dropped & kk & "; "
+            d = defTD: nFb = nFb + 1
         End If
-    Next
-    If m > 0 Then
-        ReDim out(1 To m, 1 To NCOL)
-        For Each kk In live.Keys
-            If live(kk) Then
-                r = r + 1
-                If dtR.Exists(kk) Then
-                    If Not ParseDateCell(dtR(kk), DATE_FORMAT_TEXT, d) Then d = defTD: nFb = nFb + 1
-                Else
-                    d = defTD: nFb = nFb + 1
-                End If
-                out(r, 1) = d
-                out(r, 2) = CStr(kk)
-                If secR.Exists(kk) Then out(r, 3) = secR(kk) Else out(r, 3) = ""
-                If sideR.Exists(kk) Then out(r, 4) = sideR(kk) Else out(r, 4) = ""
-                If qtyR.Exists(kk) Then out(r, 5) = QtyOut(qtyR(kk)) Else out(r, 5) = ""
-                out(r, 6) = CLng(cnt(kk))
-                If bad.Exists(kk) Then
-                    out(r, 7) = "KEY?": nBad = nBad + 1
-                ElseIf cnt(kk) >= MIN_Q Then
-                    out(r, 7) = "OK"
-                Else
-                    out(r, 7) = "< " & MIN_Q
-                End If
-                If cnt(kk) < MIN_Q Then nB = nB + 1
-                If mode <> "COUNT" Then out(r, 9) = SortedJoin(dset(kk)) Else out(r, 9) = ""
-                out(r, 8) = Empty: out(r, 10) = ""
-                kinds(Left$(CStr(kk), 3)) = kinds(Left$(CStr(kk), 3)) + 1
-                If minTD = 0 Or d < minTD Then minTD = d
-                If d > maxTD Then maxTD = d
+        isin = UCase$(CellS(v, i, cIsin)): sec = CellS(v, i, cSec)
+        sideU = UCase$(CellS(v, i, cSide)): qty = CellS(v, i, cQty)
+        inq = RequestKey(CellS(v, i, cID), d, IIf(Len(isin) > 0, isin, UCase$(sec)), sideU, qty)
+        reqs(inq) = 1
+        SameOrBad inqIsin, badInq, inq, isin
+        SameOrBad inqSide, badInq, inq, sideU
+        SameOrBad inqDate, badInq, inq, Format$(d, "yyyymmdd")
+
+        If GROUP_LEVEL = "ORDER" Then
+            uk = "ORD:" & Format$(d, "yyyy-mm-dd") & "|" & IIf(Len(isin) > 0, isin, UCase$(sec)) & "|" & sideU
+        Else
+            uk = inq
+        End If
+        If Not idx.Exists(uk) Then
+            m = m + 1: idx(uk) = m
+            uDate(m) = d: uKey(m) = uk: uSec(m) = sec: uIsin(m) = isin: uSide(m) = CellS(v, i, cSide)
+            uQty(m) = NumOrText(v, i, cQty)
+            Set uInq(m) = NewDict(): Set uAsk(m) = NewDict(): Set uQuo(m) = NewDict()
+            uPx(m) = Empty
+        End If
+        u = idx(uk)
+        uInq(u)(inq) = 1
+        If Len(uSec(u)) = 0 Then uSec(u) = sec
+        If Len(uIsin(u)) = 0 Then uIsin(u) = isin
+
+        nm = NormName(dlr)
+        If dmap.Exists(nm) Then
+            nm = dmap(nm)
+        ElseIf Not ents.Exists(nm) Then
+            unm(nm) = 1
+        End If
+        st = CellS(v, i, cSt)
+        If Len(st) = 0 Then s = "(blank)" Else s = st
+        stSeen(s) = stSeen(s) + 1
+        px = 0
+        If cPx > 0 Then px = PriceOf(v(i, cPx))
+        isQ = (px > 0)
+        isF = IsFilledStatus(st)
+        If isQ Then s = s & " @" & InvariantNum(px)
+        If uAsk(u).Exists(nm) Then uAsk(u)(nm) = uAsk(u)(nm) & " / " & s Else uAsk(u)(nm) = s
+        If isQ Then uQuo(u)(nm) = 1
+        If isF Then
+            uFill(u) = True
+            If InStr(1, ";" & uWin(u) & ";", ";" & nm & ";") = 0 Then
+                If Len(uWin(u)) > 0 Then uWin(u) = uWin(u) & ";"
+                uWin(u) = uWin(u) & nm
             End If
+            If IsEmpty(uPx(u)) And isQ Then uPx(u) = px
+        End If
+
+        bk = Format$(d, "yyyymmdd") & "|" & isin & "|" & sideU & "|" & qty
+        bondRows(bk) = bondRows(bk) + 1
+        If Not bondInq.Exists(bk) Then bondInq.Add bk, NewDict()
+        bondInq(bk)(inq) = 1
+
+        nLegs = nLegs + 1
+        legs(nLegs, 1) = d: legs(nLegs, 2) = uk: legs(nLegs, 3) = inq: legs(nLegs, 4) = sec: legs(nLegs, 5) = isin
+        legs(nLegs, 6) = CellS(v, i, cSide): legs(nLegs, 7) = NumOrText(v, i, cQty): legs(nLegs, 8) = dlr
+        legs(nLegs, 9) = nm: legs(nLegs, 10) = st
+        If isQ Then legs(nLegs, 11) = px Else legs(nLegs, 11) = ""
+        legs(nLegs, 12) = IIf(isQ, "YES", "NO"): legs(nLegs, 13) = IIf(isF, "YES", "NO")
+NextRow:
+    Next
+
+    ' one request per dealer row for the same bond/side/day/qty = the ID rule is probably wrong
+    For Each kk In bondRows.Keys
+        If bondRows(kk) >= 2 And bondInq(kk).Count = bondRows(kk) Then nSusp = nSusp + 1
+    Next
+
+    ' output, worst first: BREACH, KEY?, LOW, OK filled, OK not filled
+    If m > 0 Then
+        ReDim out(1 To m, 1 To UCOLS): ReDim rk(1 To m): ReDim ord(1 To m)
+        For u = 1 To m
+            bad = False
+            For Each kk In uInq(u).Keys
+                If badInq.Exists(kk) Then bad = True
+            Next
+            If bad Then
+                chk = "KEY?": nKey = nKey + 1: rk(u) = 1
+            ElseIf uAsk(u).Count < MIN_Q Then
+                If uFill(u) Then
+                    chk = "BREACH": nBreach = nBreach + 1: rk(u) = 0
+                Else
+                    chk = "LOW": nLow = nLow + 1: rk(u) = 2
+                End If
+            Else
+                chk = "OK"
+                If uFill(u) Then rk(u) = 3 Else rk(u) = 4
+            End If
+            If uFill(u) Then nFilled = nFilled + 1
+            If uQuo(u).Count < MIN_Q Then nQLow = nQLow + 1
+            out(u, 1) = uDate(u): out(u, 2) = uKey(u): out(u, 3) = uSec(u): out(u, 4) = uIsin(u): out(u, 5) = uSide(u)
+            out(u, 6) = uQty(u): out(u, 7) = uInq(u).Count: out(u, 8) = uAsk(u).Count: out(u, 9) = uQuo(u).Count
+            out(u, 10) = IIf(uFill(u), "YES", "NO"): out(u, 11) = uWin(u)
+            If IsEmpty(uPx(u)) Then out(u, 12) = "" Else out(u, 12) = uPx(u)
+            out(u, 13) = chk: out(u, 14) = DealerDetail(uAsk(u)): out(u, 15) = Empty: out(u, 16) = ""
+            If minTD = 0 Or uDate(u) < minTD Then minTD = uDate(u)
+            If uDate(u) > maxTD Then maxTD = uDate(u)
+            ord(u) = u
         Next
-        res("deals") = out
+        For i = 2 To m                                        ' stable insertion sort by rank
+            t = ord(i): j = i - 1
+            Do While j >= 1
+                If rk(ord(j)) <= rk(t) Then Exit Do
+                ord(j + 1) = ord(j): j = j - 1
+            Loop
+            ord(j + 1) = t
+        Next
+        res("units") = Reorder(out, ord, m)
     End If
+    If nLegs > 0 Then res("legs") = TrimRows(legs, nLegs)
 
-    '--- 6) data-quality warnings ---
-    nCmp = kinds("CMP")
-    If cRfq = 0 And cOrd = 0 And Not tktOK Then
-        warn = warn & "No RFQ / ticket id column: deals grouped by composite key (date|ISIN|side|qty|RFQ time|trader). Map HDR_RFQ to the inquiry id column. "
-    ElseIf nCmp > 0 Then
-        warn = warn & nCmp & " deal(s) without RFQ/ticket id grouped by composite key. "
-    End If
-    If nCmp > 0 And cTime = 0 Then warn = warn & "No RFQ time column: re-trades of the same size cannot be separated. "
-    If nSkip > 0 Then warn = warn & nSkip & " dealer row(s) before the first deal row could not be attributed (not counted). "
-    If nFb > 0 Then warn = warn & nFb & " deal(s) without a parseable trade date: " & Format$(defTD, "yyyy-mm-dd") & " used (check HDR_DATE / DATE_FORMAT_TEXT). "
-    If cSt = 0 Then warn = warn & "No status column: every deal treated as executed. "
-
+    If nNoDl > 0 Then warn = warn & nNoDl & " row(s) without dealer ignored. "
+    If nFb > 0 Then warn = warn & nFb & " row(s) without a readable trade date: " & Format$(defTD, "yyyy-mm-dd") & " used (check DATE_FORMAT_TEXT). "
+    If nSusp > 0 Then warn = warn & nSusp & " bond/side/day group(s) have one request per dealer row: check ID_SUFFIX_LEN. "
+    If nKey > 0 Then warn = warn & nKey & " request(s) mix ISINs, sides or dates under one ID (KEY?). "
     res("ok") = True
-    res("m") = m: res("nB") = nB: res("nBad") = nBad: res("nDropped") = nDrop: res("dropped") = dropped
-    res("nSkipped") = nSkip: res("nDateFallback") = nFb: res("unmapped") = SortedJoin(unm, ", ")
-    res("keykinds") = "RFQ=" & kinds("RFQ") + 0 & " ORD=" & kinds("ORD") + 0 & " TKT=" & kinds("TKT") + 0 & " CMP=" & nCmp + 0
+    res("m") = m: res("nLegs") = nLegs: res("nRequests") = reqs.Count
+    res("nFilled") = nFilled: res("nBreach") = nBreach: res("nLow") = nLow: res("nKey") = nKey: res("nQuotedLow") = nQLow
+    res("statuses") = CountList(stSeen): res("unmapped") = KeyList(unm, ", ")
     res("minTD") = minTD: res("maxTD") = maxTD
 Done:
     res("warnings") = Trim$(warn)
-    Set ParseExport = res
+    Set AnalyzeBlot = res
 End Function
 
-Private Function IsChildRow(v As Variant, ByVal i As Long, ByVal cOrd As Long, ByVal cRfq As Long, ByVal cID As Long, ByVal cSec As Long) As Boolean
-    IsChildRow = (Len(CellS(v, i, cOrd)) + Len(CellS(v, i, cRfq)) + Len(CellS(v, i, cID)) + Len(CellS(v, i, cSec)) = 0)
-End Function
-
-Private Function MakeTradeKey(v As Variant, ByVal i As Long, ByVal cOrd As Long, ByVal cRfq As Long, ByVal cID As Long, _
-                              ByVal cDt As Long, ByVal cSec As Long, ByVal cSide As Long, ByVal cQty As Long, _
-                              ByVal cTime As Long, ByVal cTrd As Long) As String
-    Dim s As String, d As Date, ds As String
-    s = CellS(v, i, cOrd): If Len(s) > 0 Then MakeTradeKey = "ORD:" & s: Exit Function
-    s = CellS(v, i, cRfq): If Len(s) > 0 Then MakeTradeKey = "RFQ:" & s: Exit Function
-    s = CellS(v, i, cID):  If Len(s) > 0 Then MakeTradeKey = "TKT:" & s: Exit Function
-    If cDt > 0 Then
-        If ParseDateCell(v(i, cDt), DATE_FORMAT_TEXT, d) Then ds = Format$(d, "yyyy-mm-dd") Else ds = CellS(v, i, cDt)
+' Request key: ID without its dealer-leg suffix; without ID: trade date | ISIN | side | qty
+Public Function RequestKey(ByVal id As String, ByVal d As Date, ByVal isin As String, ByVal sideU As String, ByVal qty As String) As String
+    id = Trim$(id)
+    If Len(id) > 0 Then
+        If Len(id) > ID_SUFFIX_LEN + 3 Then RequestKey = "INQ:" & Left$(id, Len(id) - ID_SUFFIX_LEN) Else RequestKey = "INQ:" & id
+    Else
+        RequestKey = "CMP:" & Format$(d, "yyyy-mm-dd") & "|" & isin & "|" & sideU & "|" & qty
     End If
-    MakeTradeKey = "CMP:" & Join(Array(ds, UCase$(CellS(v, i, cSec)), UCase$(CellS(v, i, cSide)), _
-                                       CellS(v, i, cQty), TimeKey(v, i, cTime), UCase$(CellS(v, i, cTrd))), "|")
 End Function
 
-Private Function TimeKey(v As Variant, ByVal i As Long, ByVal c As Long) As String
-    Dim x As Variant
-    If c = 0 Then Exit Function
-    x = v(i, c)
+Private Sub SameOrBad(seen As Object, bad As Object, ByVal k As String, ByVal val As String)
+    If Len(val) = 0 Then Exit Sub
+    If Not seen.Exists(k) Then
+        seen(k) = val
+    ElseIf seen(k) <> val Then
+        bad(k) = 1
+    End If
+End Sub
+
+Public Function IsFilledStatus(ByVal st As String) As Boolean
+    Dim a As Variant, t As String
+    st = LCase$(Trim$(st))
+    If Len(st) = 0 Then Exit Function
+    For Each a In Split(FILL_STATUS, "|")
+        t = Trim$(CStr(a))
+        If Len(t) > 0 Then
+            If InStr(1, st, t, vbBinaryCompare) > 0 Then IsFilledStatus = True: Exit Function
+        End If
+    Next
+End Function
+
+' Price from a cell: real number, or text with ',' or '.' decimal (96,198 / 96.198 / 1.234,5)
+Public Function PriceOf(ByVal x As Variant) As Double
+    Dim s As String, pc As Long, pd As Long
     Select Case VarType(x)
-        Case vbDouble, vbSingle, vbDate, vbCurrency, vbDecimal
-            If CDbl(x) >= 0 And CDbl(x) < 1 Then
-                TimeKey = Format$(CDate(x), "hh:nn:ss")
-            ElseIf CDbl(x) >= 1 And CDbl(x) < 2958466 Then
-                TimeKey = Format$(CDate(x), "yyyy-mm-dd hh:nn:ss")
-            Else
-                TimeKey = CellS(v, i, c)
+        Case vbDouble, vbSingle, vbLong, vbInteger, vbCurrency, vbDecimal, vbByte
+            PriceOf = CDbl(x)
+        Case vbString
+            s = Replace(Replace(Trim$(x), " ", ""), Chr$(160), "")
+            If Len(s) = 0 Then Exit Function
+            pc = InStrRev(s, ","): pd = InStrRev(s, ".")
+            If pc > 0 And pd > 0 Then
+                If pc > pd Then s = Replace(Replace(s, ".", ""), ",", ".") Else s = Replace(s, ",", "")
+            ElseIf pc > 0 Then
+                If Len(s) - Len(Replace(s, ",", "")) = 1 Then s = Replace(s, ",", ".") Else s = Replace(s, ",", "")
             End If
-        Case Else
-            TimeKey = CellS(v, i, c)
+            If IsPlainNumber(s) Then PriceOf = Val(s)
     End Select
 End Function
 
-Private Sub AddDealers(d As Object, ByVal s As String, dmap As Object, ents As Object, unm As Object, ByVal splitList As Boolean)
-    Dim i As Long, t As Variant, u As String
-    If Len(s) = 0 Then Exit Sub
-    If splitList Then
-        For i = 1 To Len(LIST_DELIMS): s = Replace(s, Mid$(LIST_DELIMS, i, 1), Chr$(1)): Next
-        s = Replace(Replace(s, vbCr, Chr$(1)), vbLf, Chr$(1))
-    End If
-    For Each t In Split(s, Chr$(1))
-        u = NormName(CStr(t))
-        If Len(u) > 0 Then
-            If dmap.Exists(u) Then
-                u = dmap(u)
-            ElseIf Not ents.Exists(u) Then
-                unm(u) = 1
-            End If
-            d(u) = 1
-        End If
-    Next
-End Sub
+Private Function NumOrText(v As Variant, ByVal i As Long, ByVal c As Long) As Variant
+    Dim x As Variant
+    NumOrText = ""
+    If c = 0 Then Exit Function
+    x = v(i, c)
+    Select Case VarType(x)
+        Case vbDouble, vbSingle, vbLong, vbInteger, vbCurrency, vbDecimal, vbByte
+            NumOrText = CDbl(x)
+        Case vbString
+            If PriceOf(x) <> 0 Then NumOrText = PriceOf(x) Else NumOrText = Trim$(x)
+    End Select
+End Function
 
-' UPPERCASE, tabs / NBSP / line breaks -> space, repeated spaces collapsed, trimmed
+Private Function DealerDetail(d As Object) As String
+    Dim k As Variant, s As String
+    For Each k In d.Keys
+        s = s & "; " & k & " [" & d(k) & "]"
+    Next
+    DealerDetail = Mid$(s, 3)
+End Function
+
+Private Function CountList(d As Object) As String
+    Dim k As Variant, s As String
+    For Each k In d.Keys: s = s & ", " & k & "=" & d(k): Next
+    CountList = Mid$(s, 3)
+End Function
+
+Private Function KeyList(d As Object, ByVal sep As String) As String
+    Dim k As Variant, s As String
+    For Each k In d.Keys: s = s & sep & k: Next
+    If Len(s) > 0 Then KeyList = Mid$(s, Len(sep) + 1)
+End Function
+
+Private Function Reorder(a As Variant, ord() As Long, ByVal m As Long) As Variant
+    Dim o() As Variant, i As Long, j As Long
+    ReDim o(1 To m, 1 To UBound(a, 2))
+    For i = 1 To m
+        For j = 1 To UBound(a, 2): o(i, j) = a(ord(i), j): Next
+    Next
+    Reorder = o
+End Function
+
+Private Function TrimRows(a As Variant, ByVal n As Long) As Variant
+    Dim o() As Variant, i As Long, j As Long
+    ReDim o(1 To n, 1 To UBound(a, 2))
+    For i = 1 To n
+        For j = 1 To UBound(a, 2): o(i, j) = a(i, j): Next
+    Next
+    TrimRows = o
+End Function
+
 Public Function NormName(ByVal s As String) As String
     s = Replace(Replace(Replace(Replace(s, vbTab, " "), Chr$(160), " "), vbCr, " "), vbLf, " ")
     Do While InStr(1, s, "  ") > 0: s = Replace(s, "  ", " "): Loop
@@ -1883,30 +1181,18 @@ Public Function LoadDealerMap() As Object
     Set LoadDealerMap = d
 End Function
 
-Private Function IsExcluded(ByVal st As String) As Boolean
-    Dim a As Variant, t As String
-    If Len(st) = 0 Then Exit Function
-    st = LCase$(st)
-    For Each a In Split(EXCL_STATUS, "|")
-        t = Trim$(CStr(a))
-        If Len(t) > 0 Then
-            If InStr(1, st, t, vbBinaryCompare) > 0 Then IsExcluded = True: Exit Function
-        End If
-    Next
-End Function
-
 Public Function HeaderIndex(hdr As Variant, ByVal aliases As String) As Long
     Dim a As Variant, t As String, j As Long
-    For Each a In Split(aliases, "|")                         ' 1) exact match, by priority
-        t = NormHeaderText(CStr(a))
+    For Each a In Split(aliases, "|")
+        t = LCase$(NormName(CStr(a)))
         If Len(t) > 0 Then
             For j = LBound(hdr, 2) To UBound(hdr, 2)
                 If NormH(hdr(1, j)) = t Then HeaderIndex = j: Exit Function
             Next
         End If
     Next
-    For Each a In Split(aliases, "|")                         ' 2) contains, only aliases >= 5 chars
-        t = NormHeaderText(CStr(a))
+    For Each a In Split(aliases, "|")
+        t = LCase$(NormName(CStr(a)))
         If Len(t) >= 5 Then
             For j = LBound(hdr, 2) To UBound(hdr, 2)
                 If InStr(1, NormH(hdr(1, j)), t, vbBinaryCompare) > 0 Then HeaderIndex = j: Exit Function
@@ -1918,78 +1204,21 @@ End Function
 Public Function NormH(x As Variant) As String
     If IsError(x) Then Exit Function
     If IsEmpty(x) Or IsNull(x) Then Exit Function
-    NormH = NormHeaderText(CStr(x))
-End Function
-
-Private Function NormHeaderText(ByVal s As String) As String
-    NormHeaderText = LCase$(NormName(s))
+    NormH = LCase$(NormName(CStr(x)))
 End Function
 
 Private Function MapDesc(hdr As Variant, roles As Variant) As String
-    Dim i As Long, s As String, used As Object, j As Long, un As String
-    Set used = NewDict()
+    Dim i As Long, s As String
     For i = LBound(roles) To UBound(roles) Step 2
-        If roles(i + 1) > 0 Then
-            s = s & roles(i) & "=" & ColLetter(roles(i + 1)) & " '" & NormH(hdr(1, roles(i + 1))) & "'; "
-            used(roles(i + 1)) = 1
-        Else
-            s = s & roles(i) & "=-; "
-        End If
+        If roles(i + 1) > 0 Then s = s & roles(i) & "='" & NormH(hdr(1, roles(i + 1))) & "' " Else s = s & roles(i) & "=- "
     Next
-    For j = LBound(hdr, 2) To UBound(hdr, 2)
-        If Not used.Exists(j) And Len(NormH(hdr(1, j))) > 0 Then un = un & ColLetter(j) & " '" & NormH(hdr(1, j)) & "', "
-    Next
-    If Len(un) > 0 Then s = s & "unmapped: " & Left$(un, Len(un) - 2)
-    MapDesc = s
+    MapDesc = Trim$(s)
 End Function
 
-Private Function Collisions(roles As Variant) As String
-    Dim i As Long, j As Long, s As String
-    For i = LBound(roles) To UBound(roles) Step 2
-        For j = i + 2 To UBound(roles) Step 2
-            If roles(i + 1) > 0 And roles(i + 1) = roles(j + 1) Then
-                If Not ((roles(i) = "ORDER" And roles(j) = "TICKET") Or (roles(i) = "TICKET" And roles(j) = "ORDER")) Then
-                    s = s & "Column " & ColLetter(roles(i + 1)) & " mapped to both " & roles(i) & " and " & roles(j) & ". "
-                End If
-            End If
-        Next
-    Next
-    Collisions = s
-End Function
-
-Private Function ColLetter(ByVal c As Long) As String
-    Dim s As String
-    Do While c > 0
-        s = Chr$(65 + ((c - 1) Mod 26)) & s
-        c = (c - 1) \ 26
-    Loop
-    ColLetter = s
-End Function
-
-Public Function SortedJoin(d As Object, Optional ByVal sep As String = ";") As String
-    Dim a() As String, i As Long, j As Long, t As String, k As Variant, n As Long
-    If d.Count = 0 Then Exit Function
-    ReDim a(1 To d.Count)
-    For Each k In d.Keys: n = n + 1: a(n) = CStr(k): Next
-    For i = 2 To n                                            ' insertion sort, binary compare
-        t = a(i): j = i - 1
-        Do While j >= 1
-            If StrComp(a(j), t, vbBinaryCompare) <= 0 Then Exit Do
-            a(j + 1) = a(j): j = j - 1
-        Loop
-        a(j + 1) = t
-    Next
-    SortedJoin = Join(a, sep)
-End Function
-
-Private Function QtyOut(ByVal s As String) As Variant
-    If IsPlainNumber(s) Then QtyOut = Val(s) Else QtyOut = s
-End Function
-
-' Text of a cell, locale-independent for numbers and dates
 Public Function CellS(v As Variant, ByVal i As Long, ByVal c As Long) As String
     Dim x As Variant
     If c = 0 Then Exit Function
+    If c > UBound(v, 2) Then Exit Function
     x = v(i, c)
     Select Case VarType(x)
         Case vbString
@@ -2025,7 +1254,6 @@ Public Function ParseDateCell(ByVal x As Variant, ByVal fmt As String, ByRef d A
     End Select
 End Function
 
-' ISO yyyy-mm-dd is always accepted; anything else only through fmt (MM/DD/YYYY, DD-MMM-YY, YYYYMMDD...)
 Public Function ParseDateText(ByVal s As String, ByVal fmt As String, ByRef d As Date) As Boolean
     Dim runs As Collection, grp As Collection, i As Long, k As Long, p As Long, sepd As Boolean
     Dim y As Long, mo As Long, dd As Long
@@ -2059,11 +1287,10 @@ Public Function ParseDateText(ByVal s As String, ByVal fmt As String, ByRef d As
     ParseDateText = MakeDate(y, mo, dd, d)
 End Function
 
-' "" if fmt is a supported date format, else the problem
 Public Function ValidateDateFormat(ByVal fmt As String) As String
     Dim runs As Collection, sepd As Boolean, r As Variant, nD As Long, nM As Long, nY As Long
     Set runs = FormatRuns(UCase$(Trim$(fmt)), sepd)
-    If runs Is Nothing Then ValidateDateFormat = "Unsupported format '" & fmt & "' (use D/M/Y letters, e.g. MM/DD/YYYY, DD-MMM-YY, YYYYMMDD).": Exit Function
+    If runs Is Nothing Then ValidateDateFormat = "Unsupported format '" & fmt & "' (e.g. DD/MM/YYYY, MM/DD/YYYY, DD-MMM-YY).": Exit Function
     For Each r In runs
         Select Case Left$(r, 1)
             Case "D": nD = nD + 1
@@ -2071,10 +1298,9 @@ Public Function ValidateDateFormat(ByVal fmt As String) As String
             Case "Y": nY = nY + 1
         End Select
     Next
-    If nD <> 1 Or nM <> 1 Or nY <> 1 Then ValidateDateFormat = "Format '" & fmt & "' needs exactly one day, one month and one year part."
+    If nD <> 1 Or nM <> 1 Or nY <> 1 Then ValidateDateFormat = "Format '" & fmt & "' needs one day, one month and one year part."
 End Function
 
-' Letter runs of a format. sepd = runs separated by non-letters; Nothing if invalid / mixed
 Private Function FormatRuns(ByVal fmt As String, ByRef sepd As Boolean) As Collection
     Dim c As New Collection, i As Long, ch As String, cur As String, nSep As Long, gaps As Long, prevSep As Boolean
     If Len(fmt) = 0 Then Exit Function
@@ -2095,7 +1321,7 @@ Private Function FormatRuns(ByVal fmt As String, ByRef sepd As Boolean) As Colle
     Next
     If Len(cur) > 0 Then c.Add cur
     If c.Count <> 3 Then Exit Function
-    If gaps > 0 And nSep > 0 Then Exit Function               ' mixed separated / positional
+    If gaps > 0 And nSep > 0 Then Exit Function
     sepd = (nSep > 0)
     For i = 1 To c.Count
         Select Case c(i)
@@ -2150,7 +1376,7 @@ Private Function MonthFromName(ByVal t As String) As Long
     t = UCase$(Left$(t, 3))
     If Len(t) < 3 Then Exit Function
     p = InStr(1, "JANFEBMARAPRMAYJUNJULAUGSEPOCTNOVDEC", t)
-    If p = 0 Then p = InStr(1, "JANFEVMARABRMAIJUNJULAGOSETOUTNOVDEZ", t)   ' Portuguese
+    If p = 0 Then p = InStr(1, "JANFEVMARABRMAIJUNJULAGOSETOUTNOVDEZ", t)
     If p > 0 And (p - 1) Mod 3 = 0 Then MonthFromName = (p - 1) \ 3 + 1
 End Function
 
@@ -2163,68 +1389,54 @@ Private Function MakeDate(ByVal y As Long, ByVal mo As Long, ByVal dd As Long, B
 End Function
 
 '==========================================================================================
-'                                    PROCESS (I/O wrapper around the core)
+'                                    PROCESS (I/O around the core)
 '==========================================================================================
 Private Function ProcessData(v As Variant, vRaw As Variant, ByVal srcLabel As String, ByVal srcWb As Object, ByVal srcFile As String) As Boolean
-    Dim res As Object, out As Variant, m As Long, arch As String, i As Long, ts As Date
-    Dim prevMax As Double, dates As Object, msg As String, lst As String, gaps As String, td As Date
-    Dim nB As Long, nBad As Long
-
+    Dim res As Object, out As Variant, m As Long, arch As String, i As Long, ts As Date, prevMax As Double
+    Dim dates As Object, msg As String, lst As String, gaps As String, info As String
     On Error GoTo EH
-    Set res = ParseExport(v, LoadDealerMap(), PrevBusinessDay(Date))
-    Notify "Parsed " & srcLabel & ": " & (UBound(v, 1) - 1) & " data row(s) | mode=" & res("mode") & _
-           IIf(DEALER_MODE = "AUTO", " (auto-detected: pin DEALER_MODE on CONFIG)", " (pinned)") & _
-           " | GROUP_LEVEL=" & GROUP_LEVEL & " | keys " & res("keykinds") & vbLf & "Header mapping: " & res("mapping"), LV_INFO
-    If Len(res("warnings")) > 0 Then Notify "Data quality (" & srcLabel & "): " & res("warnings"), LV_WARN
-    If Not res("ok") Then Notify "ERROR parsing " & srcLabel & ": " & res("err"), LV_ERROR: Exit Function
-    If res("nDropped") > 0 Then WriteLog res("nDropped") & " deal(s) excluded as not executed (all rows match EXCL_STATUS): " & res("dropped"), LV_INFO
-    If Len(res("unmapped")) > 0 Then WriteLog "Dealer names not in DEALER_MAP (check aliases): " & res("unmapped"), LV_INFO
+    Set res = AnalyzeBlot(v, LoadDealerMap(), PrevBusinessDay(Date))
+    WriteLog "Read " & srcLabel & ": " & res("nLegs") & " dealer row(s), " & res("nRequests") & " request(s). " & res("mapping"), LV_INFO
+    If Len(res("warnings")) > 0 Then Notify "Data check (" & srcLabel & "): " & res("warnings"), LV_WARN
+    If Not res("ok") Then Notify "ERROR reading " & srcLabel & ": " & res("err"), LV_ERROR: Exit Function
+    If Len(res("unmapped")) > 0 Then WriteLog "Dealer names not in DEALER_MAP: " & res("unmapped"), LV_INFO
+    WriteLog "Statuses seen: " & res("statuses"), LV_INFO
 
-    m = res("m")
+    m = res("m"): ts = Now
+    If m > 0 Then arch = ArchiveExport(srcWb, srcFile, vRaw, res("maxTD")) Else arch = ArchiveExport(srcWb, srcFile, vRaw, PrevBusinessDay(Date))
     If m = 0 Then
-        arch = ArchiveExport(srcWb, srcFile, vRaw, PrevBusinessDay(Date))
-        WriteRaw vRaw
-        Notify "ALERT: export contains no executed trades (" & srcLabel & "). Expected trade date " & _
-               Format$(PrevBusinessDay(Date), "yyyy-mm-dd") & ". Confirm that the desk did not trade." & _
-               IIf(Len(arch) > 0, " Archived: " & arch, ""), LV_ALERT
-        ProcessData = True
-        Exit Function
+        WriteSheetTable GetSheet(SH_QUOTES), QuoteHeader(), Empty, 0
+        Notify "ALERT: the export has no dealer rows (" & srcLabel & "). Confirm that the desk did not trade.", LV_ALERT
+        ProcessData = True: Exit Function
     End If
-
-    out = res("deals"): ts = Now: td = res("maxTD")
-    arch = ArchiveExport(srcWb, srcFile, vRaw, td)
+    out = res("units")
     For i = 1 To m
-        out(i, 8) = ts
-        out(i, 10) = IIf(Len(arch) > 0, arch, srcLabel)
+        out(i, 15) = ts
+        If Len(arch) > 0 Then out(i, 16) = arch Else out(i, 16) = srcLabel
     Next
     prevMax = HistDailyMaxDate()
-    WriteRaw vRaw
-    WriteDeals out, m
+    WriteSheetTable GetSheet(SH_QUOTES), QuoteHeader(), res("legs"), res("nLegs")
+    WriteSheetTable GetSheet(SH_INQ), UnitHeader(), out, m
     Set dates = UpsertHist(GetSheet(SH_HIST), out, m)
     RecalcHistDaily GetSheet(SH_HIST), GetSheet(SH_HD), dates
     gaps = CoverageGaps(prevMax, res("minTD"))
-    BuildDashboard out, m, "Last run " & Format$(ts, "yyyy-mm-dd hh:nn") & " | " & srcLabel & " | mode " & res("mode") & " | " & GROUP_LEVEL & " level"
+    info = "Last run " & Format$(ts, "yyyy-mm-dd hh:nn") & " | " & srcLabel & " | " & GROUP_LEVEL & " level | " & res("nLegs") & " dealer rows"
+    BuildDashboard out, m, res, info
 
-    nB = res("nB"): nBad = res("nBad")
-    msg = "Trades " & DateRangeText(res("minTD"), res("maxTD")) & ": " & m & " deal(s) | " & nB & " below " & MIN_Q & _
-          " counterparties (" & Format$(nB / m, "0.0%") & ") | mode=" & res("mode")
-    If nBad > 0 Then msg = msg & " | " & nBad & " deal(s) with inconsistent key (KEY?)"
-    If nB > 0 Or nBad > 0 Then
+    msg = "Trades " & DateRangeText(res("minTD"), res("maxTD")) & ": " & m & " request(s), " & res("nFilled") & " filled, " & _
+          res("nBreach") & " BREACH (filled, < " & MIN_Q & " asked), " & res("nLow") & " LOW (not filled, < " & MIN_Q & " asked), " & res("nKey") & " KEY?"
+    If res("nBreach") > 0 Or res("nKey") > 0 Then
         For i = 1 To m
-            If out(i, 7) <> "OK" Then
-                lst = lst & vbLf & Format$(out(i, 1), "yyyy-mm-dd") & "  " & out(i, 2) & "  " & out(i, 3) & "  " & out(i, 4) & "  " & out(i, 5) & _
-                      "  dealers=" & out(i, 6) & IIf(Len(out(i, 9)) > 0, " (" & out(i, 9) & ")", "") & "  [" & out(i, 7) & "]"
+            If out(i, 13) = "BREACH" Or out(i, 13) = "KEY?" Then
+                lst = lst & vbLf & "[" & out(i, 13) & "] " & Format$(out(i, 1), "yyyy-mm-dd") & "  " & out(i, 3) & "  " & out(i, 4) & "  " & out(i, 5) & _
+                      "  asked=" & out(i, 8) & " quoted=" & out(i, 9) & "  winner=" & out(i, 11) & "  " & out(i, 14)
             End If
         Next
         Notify "ALERT " & msg & lst, LV_ALERT
     Else
         Notify "OK " & msg, LV_INFO
-        If SEND_OK_EMAIL And Len(ALERT_TO) > 0 And Not gHeadless Then SendMail "[BLOT Best Ex] OK " & DateRangeText(res("minTD"), res("maxTD")), "OK " & msg
     End If
-    If Len(gaps) > 0 Then
-        Notify "ALERT coverage gap: no BLOT data loaded for business day(s) " & gaps & _
-               ". Backfill with Import File, or check that OPEN_SEQ shows the previous business day (README step 2g).", LV_ALERT
-    End If
+    If Len(gaps) > 0 Then Notify "ALERT coverage gap: no BLOT data for business day(s) " & gaps & ". Load them with Import File.", LV_ALERT
     ProcessData = True
     Exit Function
 EH:
@@ -2235,19 +1447,17 @@ Private Function DateRangeText(ByVal d0 As Date, ByVal d1 As Date) As String
     If d0 = d1 Then DateRangeText = Format$(d0, "yyyy-mm-dd") Else DateRangeText = Format$(d0, "yyyy-mm-dd") & ".." & Format$(d1, "yyyy-mm-dd")
 End Function
 
-' Dated copy of the raw export in ARCHIVE_DIR. Returns the archive path ("" if not archived).
 Private Function ArchiveExport(ByVal srcWb As Object, ByVal srcFile As String, vRaw As Variant, ByVal td As Date) As String
     Dim base As String, ext As String, p As String, wb As Workbook
     If Len(ARCHIVE_DIR) = 0 Then
-        Notify "ALERT: ARCHIVE_DIR is empty on CONFIG - the raw export was NOT archived (regulatory evidence).", LV_ALERT
+        Notify "ALERT: ARCHIVE_DIR is empty on CONFIG - the export was NOT archived.", LV_ALERT
         Exit Function
     End If
     EnsureFolder ARCHIVE_DIR
     base = ARCHIVE_DIR & "\BLOT_" & Format$(td, "yyyymmdd") & "_" & Format$(Now, "yyyymmdd_hhnnss")
     On Error GoTo Fallback
     If Len(srcFile) > 0 Then
-        ext = Mid$(srcFile, InStrRev(srcFile, "."))
-        p = base & LCase$(ext)
+        p = base & LCase$(Mid$(srcFile, InStrRev(srcFile, ".")))
         FileCopy srcFile, p
     ElseIf Not srcWb Is Nothing Then
         Select Case srcWb.FileFormat
@@ -2278,21 +1488,26 @@ Fallback:
     Exit Function
 Failed:
     Application.DisplayAlerts = True
-    Notify "ALERT: could not archive the raw export to " & ARCHIVE_DIR & " (" & Err.Description & ").", LV_ALERT
+    Notify "ALERT: could not archive the export to " & ARCHIVE_DIR & " (" & Err.Description & ").", LV_ALERT
     On Error GoTo -1
     On Error Resume Next
     If Not wb Is Nothing Then wb.Close False
 End Function
 
 '==========================================================================================
-'                                    OUTPUT
+'                                    OUTPUT SHEETS
 '==========================================================================================
-Public Function HistHeader() As Variant
-    HistHeader = Array("TradeDate", "TradeKey", "Security", "Side", "Qty", "NDealers", "Status", "LoadedAt", "Dealers", "Source")
+Public Function UnitHeader() As Variant
+    UnitHeader = Array("TradeDate", "Key", "Security", "ISIN", "Side", "Qty", "Requests", "Asked", "Quoted", "Filled", _
+                       "Winner", "FillPrice", "Check", "Dealers [status @price]", "LoadedAt", "Source")
 End Function
 
-Public Function HistDailyHeader() As Variant
-    HistDailyHeader = Array("TradeDate", "NTrades", "NBelowMin", "PctBelowMin", "AvgDealers", "MinDealers", "MaxDealers", "UpdatedAt", "NKeyIssues")
+Public Function QuoteHeader() As Variant
+    QuoteHeader = Array("TradeDate", "Key", "Request", "Security", "ISIN", "Side", "Qty", "BrkrName", "Dealer", "Status", "Price", "Quoted", "Filled")
+End Function
+
+Public Function DailyHeader() As Variant
+    DailyHeader = Array("TradeDate", "Requests", "Filled", "Breach", "Low", "KeyIssues", "PctFilledCompliant", "AvgAsked", "UpdatedAt")
 End Function
 
 Public Sub EnsureHeader(ws As Worksheet, h As Variant)
@@ -2300,19 +1515,16 @@ Public Sub EnsureHeader(ws As Worksheet, h As Variant)
     n = UBound(h) - LBound(h) + 1
     If Len(ws.Range("A1").Value) = 0 Or ws.Cells(1, n).Value <> h(UBound(h)) Then
         ws.Range("A1").Resize(1, n).Value = h
-        ws.Range("A1").Resize(1, n).Font.Bold = True
-        ws.Range("A1").Resize(1, n).Interior.Color = RGB(217, 225, 242)
-        ws.Columns("A").NumberFormat = "yyyy-mm-dd"
-        ws.Columns("A").ColumnWidth = 12
-        ws.Columns("H").NumberFormat = "yyyy-mm-dd hh:mm:ss"
-        ws.Columns("H").ColumnWidth = 19
-        If h(1) = "TradeKey" Then
-            ws.Columns("B").NumberFormat = "@"
-            ws.Columns("B").ColumnWidth = 30: ws.Columns("C").ColumnWidth = 16
-            ws.Columns("I").ColumnWidth = 36: ws.Columns("J").ColumnWidth = 60
-        Else
-            ws.Columns("D").NumberFormat = "0.0%": ws.Columns("E").NumberFormat = "0.00"
-            ws.Columns("B:G").ColumnWidth = 11: ws.Columns("I").ColumnWidth = 11
+        Hdr ws.Range("A1").Resize(1, n)
+        ws.Columns("A").NumberFormat = "yyyy-mm-dd": ws.Columns("A").ColumnWidth = 11
+        If h(1) = "Key" Then
+            ws.Columns("B").NumberFormat = "@": ws.Columns("B").ColumnWidth = 30
+            ws.Columns("C").ColumnWidth = 26: ws.Columns("D").ColumnWidth = 14
+            ws.Columns("N").ColumnWidth = 80: ws.Columns("O").NumberFormat = "yyyy-mm-dd hh:mm"
+            ws.Columns("O").ColumnWidth = 16: ws.Columns("P").ColumnWidth = 50
+        ElseIf h(1) = "Requests" Then
+            ws.Columns("G").NumberFormat = "0.0%": ws.Columns("H").NumberFormat = "0.0"
+            ws.Columns("I").NumberFormat = "yyyy-mm-dd hh:mm": ws.Columns("B:I").ColumnWidth = 12
         End If
     End If
 End Sub
@@ -2320,7 +1532,7 @@ End Sub
 Private Sub EnsureLogHeader(ws As Worksheet)
     If Len(ws.Range("A1").Value) = 0 Then
         ws.Range("A1:C1").Value = Array("Timestamp", "Level", "Message")
-        ws.Range("A1:C1").Font.Bold = True: ws.Range("A1:C1").Interior.Color = RGB(217, 225, 242)
+        Hdr ws.Range("A1:C1")
         ws.Columns("A").ColumnWidth = 20: ws.Columns("B").ColumnWidth = 8: ws.Columns("C").ColumnWidth = 160
     End If
 End Sub
@@ -2339,45 +1551,42 @@ Private Function TextSafe(v As Variant) As Variant
     TextSafe = o
 End Function
 
-Private Sub WriteRaw(vRaw As Variant)
-    With GetSheet(SH_RAW)
-        .Cells.Clear
-        If IsArray(vRaw) Then .Range("A1").Resize(UBound(vRaw, 1), UBound(vRaw, 2)).Value = TextSafe(vRaw)
-    End With
-End Sub
-
-Private Sub WriteDeals(out As Variant, ByVal m As Long)
-    Dim ws As Worksheet
-    Set ws = GetSheet(SH_DEALS)
+Private Sub WriteSheetTable(ws As Worksheet, h As Variant, data As Variant, ByVal n As Long)
+    Dim nc As Long
+    nc = UBound(h) - LBound(h) + 1
     ws.Cells.Clear
-    EnsureHeader ws, HistHeader()
-    ws.Range("A2").Resize(m, NCOL).Value = TextSafe(out)
-    ws.Range("A1").Resize(m + 1, NCOL).Sort Key1:=ws.Range("F1"), Order1:=xlAscending, Header:=xlYes
-    ws.Columns("A:I").AutoFit
+    ws.Range("A1").Resize(1, nc).Value = h
+    Hdr ws.Range("A1").Resize(1, nc)
+    ws.Columns("A").NumberFormat = "yyyy-mm-dd"
+    If n > 0 Then ws.Range("A2").Resize(n, nc).Value = TextSafe(data)
+    ws.Range("A1").Resize(1, nc).EntireColumn.AutoFit
+    If nc = UCOLS Then
+        ws.Columns(14).ColumnWidth = 80: ws.Columns(15).NumberFormat = "yyyy-mm-dd hh:mm": ws.Columns(16).ColumnWidth = 50
+    End If
 End Sub
 
-' Upsert one row per (TradeDate, TradeKey): re-running a day never duplicates. Returns the touched dates.
+' One row per (TradeDate, Key): re-running a day updates rows, never duplicates. Returns the dates touched.
 Public Function UpsertHist(ws As Worksheet, out As Variant, ByVal m As Long) As Object
     Dim ex As Object, hv As Variant, lastR As Long, i As Long, j As Long, rw As Long, k As String
     Dim one() As Variant, dates As Object, ov As Variant
-    EnsureHeader ws, HistHeader()
+    EnsureHeader ws, UnitHeader()
     Set ex = NewDict(): Set dates = NewDict()
     lastR = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
     If lastR >= 2 Then
         hv = ws.Range("A1:B" & lastR).Value
         For i = 2 To UBound(hv, 1): ex(HistKey(hv(i, 1), hv(i, 2))) = i: Next
     End If
-    ReDim one(1 To 1, 1 To NCOL)
+    ReDim one(1 To 1, 1 To UCOLS)
     ov = TextSafe(out)
     For i = 1 To m
-        For j = 1 To NCOL: one(1, j) = ov(i, j): Next
+        For j = 1 To UCOLS: one(1, j) = ov(i, j): Next
         k = HistKey(out(i, 1), out(i, 2))
         If ex.Exists(k) Then
             rw = ex(k)
         Else
             lastR = lastR + 1: rw = lastR: ex(k) = rw
         End If
-        ws.Cells(rw, 1).Resize(1, NCOL).Value = one
+        ws.Cells(rw, 1).Resize(1, UCOLS).Value = one
         dates(CLng(out(i, 1))) = 1
     Next
     Set UpsertHist = dates
@@ -2392,28 +1601,31 @@ Private Function HistKey(d As Variant, id As Variant) As String
     End Select
 End Function
 
-' HIST_DAILY rows of the given dates are recomputed from HIST (the audit trail is the source of truth)
+' HIST_DAILY rows of the given dates recomputed from HIST (the audit trail is the source of truth)
 Public Sub RecalcHistDaily(wsH As Worksheet, wsD As Worksheet, dates As Object)
     Dim hv As Variant, lastR As Long, i As Long, dk As Long, agg As Object, a As Variant, k As Variant
-    Dim dv As Variant, rw As Long, rowOf As Object, q As Long, lastD As Long
-    EnsureHeader wsD, HistDailyHeader()
+    Dim dv As Variant, rw As Long, rowOf As Object, lastD As Long, ck As String, pct As Variant
+    EnsureHeader wsD, DailyHeader()
     lastR = wsH.Cells(wsH.Rows.Count, 1).End(xlUp).Row
     If lastR < 2 Then Exit Sub
-    hv = wsH.Range("A1:G" & lastR).Value2
+    hv = wsH.Range("A1:M" & lastR).Value2
     Set agg = NewDict()
     For i = 2 To UBound(hv, 1)
         If VarType(hv(i, 1)) = vbDouble Then
             dk = CLng(Int(hv(i, 1)))
             If dates.Exists(dk) Then
-                If Not agg.Exists(dk) Then agg(dk) = Array(0#, 0#, 0#, 1000000#, -1#, 0#)
+                If Not agg.Exists(dk) Then agg(dk) = Array(0#, 0#, 0#, 0#, 0#, 0#, 0#)  ' n, filled, breach, low, key, sumAsked, filledOK
                 a = agg(dk)
-                q = CLng(Val(CStr(hv(i, 6))))
+                ck = CStr(hv(i, 13))
                 a(0) = a(0) + 1
-                If q < MIN_Q Then a(1) = a(1) + 1
-                a(2) = a(2) + q
-                If q < a(3) Then a(3) = q
-                If q > a(4) Then a(4) = q
-                If CStr(hv(i, 7)) = "KEY?" Then a(5) = a(5) + 1
+                If CStr(hv(i, 10)) = "YES" Then
+                    a(1) = a(1) + 1
+                    If ck = "OK" Then a(6) = a(6) + 1
+                End If
+                If ck = "BREACH" Then a(2) = a(2) + 1
+                If ck = "LOW" Then a(3) = a(3) + 1
+                If ck = "KEY?" Then a(4) = a(4) + 1
+                a(5) = a(5) + Val(CStr(hv(i, 8)))
                 agg(dk) = a
             End If
         End If
@@ -2433,7 +1645,8 @@ Public Sub RecalcHistDaily(wsH As Worksheet, wsD As Worksheet, dates As Object)
         Else
             lastD = lastD + 1: rw = lastD: rowOf(k) = rw
         End If
-        wsD.Cells(rw, 1).Resize(1, 9).Value = Array(CDate(k), a(0), a(1), a(1) / a(0), a(2) / a(0), a(3), a(4), Now, a(5))
+        If a(1) > 0 Then pct = a(6) / a(1) Else pct = ""
+        wsD.Cells(rw, 1).Resize(1, 9).Value = Array(CDate(k), a(0), a(1), a(2), a(3), a(4), pct, a(5) / a(0), Now)
     Next
     If lastD > 2 Then wsD.Range("A1").Resize(lastD, 9).Sort Key1:=wsD.Range("A1"), Order1:=xlAscending, Header:=xlYes
 End Sub
@@ -2443,7 +1656,6 @@ Private Function HistDailyMaxDate() As Double
     HistDailyMaxDate = Application.WorksheetFunction.Max(GetSheet(SH_HD).Range("A:A"))
 End Function
 
-' Business days strictly between the last loaded trade date and the first new one
 Private Function CoverageGaps(ByVal prevMax As Double, ByVal newMin As Date) As String
     Dim d As Date, s As String, n As Long
     If prevMax < 1 Or CDbl(newMin) <= prevMax + 1 Then Exit Function
@@ -2453,171 +1665,154 @@ Private Function CoverageGaps(ByVal prevMax As Double, ByVal newMin As Date) As 
             If n <= 30 Then s = s & Format$(d, "yyyy-mm-dd") & " "
         End If
     Next
-    If n > 30 Then s = s & "(+" & (n - 30) & " more)"
     CoverageGaps = Trim$(s)
 End Function
 
-Private Sub BuildDashboard(out As Variant, ByVal m As Long, ByVal info As String)
-    Dim ws As Worksheet, co As ChartObject, nB As Long, nBad As Long, avgQ As Double, mn As Long, mx As Long
-    Dim t0 As Date, t1 As Date, i As Long, q As Long, r As Long, dist() As Long, lk As String
-    Dim hd As Worksheet, lr As Long, r0 As Long, hv As Variant, rr As Long
+'==========================================================================================
+'                                    DASHBOARD
+'==========================================================================================
+Private Sub BuildDashboard(out As Variant, ByVal m As Long, ByVal res As Object, ByVal info As String)
+    Dim ws As Worksheet, i As Long, r As Long, q As Long, mx As Long, nFill As Long, nOkFill As Long
+    Dim dist() As Long, hd As Worksheet, lr As Long, hv As Variant, rr As Long, c As Long, tbl() As Variant
+    Dim t0 As Date, t1 As Date, unitWord As String
 
     Set ws = GetSheet(SH_DASH)
-    For Each co In ws.ChartObjects: co.Delete: Next
-    On Error Resume Next: ws.Cells.Validation.Delete: On Error GoTo 0
     ws.Cells.Clear
+    On Error Resume Next: ws.Cells.FormatConditions.Delete: On Error GoTo 0
     AddSheetButtons ws, DashButtons()
     ws.Columns("A").ColumnWidth = 2
-
-    ws.Range("B3").Value = "BLOT - Best Execution | minimum " & MIN_Q & " counterparties asked per deal (Banco de Portugal)"
-    ws.Range("B3").Font.Size = 14: ws.Range("B3").Font.Bold = True
+    ws.Range("B3").Value = "BLOT Best Execution  |  every quote request must ask at least " & MIN_Q & " counterparties (Banco de Portugal)"
+    ws.Range("B3").Font.Size = 15: ws.Range("B3").Font.Bold = True: ws.Range("B3").Font.Color = RGB(31, 56, 100)
     ws.Range("B4").Value = "'" & info
     ws.Range("B4").Font.Italic = True: ws.Range("B4").Font.Color = RGB(89, 89, 89)
-    If m = 0 Then
-        ws.Range("B6").Value = "No data loaded yet: fill CONFIG, click Validate Config, then Run Now (or Import File)."
+    If m = 0 Or res Is Nothing Then
+        ws.Range("B6").Value = "No data yet: Run Now, or paste the BLOT grid on PASTE and click Process Pasted Data."
         ws.Columns("B").ColumnWidth = 40
         Exit Sub
     End If
+    If GROUP_LEVEL = "ORDER" Then unitWord = "Orders" Else unitWord = "Quote requests"
 
-    Stats out, m, nB, nBad, avgQ, mn, mx, t0, t1
-    ws.Range("B6:B11").Value = Application.Transpose(Array("Trade date(s)", "No. trades (deals)", _
-        "No. deals < " & MIN_Q & " counterparties", "% deals < " & MIN_Q & " counterparties", _
-        "Avg counterparties / deal", "Deals with inconsistent key (KEY?)"))
-    ws.Range("B6:B11").Font.Bold = True
+    '--- KPIs ---
+    For i = 1 To m
+        If out(i, 10) = "YES" Then
+            nFill = nFill + 1
+            If out(i, 13) = "OK" Then nOkFill = nOkFill + 1
+        End If
+        If out(i, 8) > mx Then mx = out(i, 8)
+        If t0 = 0 Or out(i, 1) < t0 Then t0 = out(i, 1)
+        If out(i, 1) > t1 Then t1 = out(i, 1)
+    Next
+    ws.Range("B6:B14").Value = Application.Transpose(Array("Trade date", unitWord, "Filled", "Not filled", _
+        "BREACH: filled with < " & MIN_Q & " asked", "LOW: not filled, < " & MIN_Q & " asked", _
+        "Requests with < " & MIN_Q & " dealers quoting", "KEY?: ambiguous grouping", "% filled trades compliant"))
     ws.Range("C6").Value = "'" & DateRangeText(t0, t1)
     ws.Range("C7").Value = m
-    ws.Range("C8").Value = nB
-    ws.Range("C9").Value = nB / m: ws.Range("C9").NumberFormat = "0.0%"
-    ws.Range("C10").Value = avgQ:  ws.Range("C10").NumberFormat = "0.00"
-    ws.Range("C11").Value = nBad
-    ws.Range("C6:C11").HorizontalAlignment = xlRight
+    ws.Range("C8").Value = nFill
+    ws.Range("C9").Value = m - nFill
+    ws.Range("C10").Value = res("nBreach")
+    ws.Range("C11").Value = res("nLow")
+    ws.Range("C12").Value = res("nQuotedLow")
+    ws.Range("C13").Value = res("nKey")
+    If nFill > 0 Then ws.Range("C14").Value = nOkFill / nFill Else ws.Range("C14").Value = "'-"
+    ws.Range("C14").NumberFormat = "0.0%"
+    ws.Range("B6:C14").Borders.Color = RGB(217, 217, 217)
+    ws.Range("C6:C14").HorizontalAlignment = xlRight: ws.Range("C6:C14").Font.Bold = True
+    If res("nBreach") > 0 Then ws.Range("B10:C10").Interior.Color = RGB(255, 199, 206)
+    If res("nKey") > 0 Then ws.Range("B13:C13").Interior.Color = RGB(255, 235, 156)
 
-    With ws.Range("B13:C13")
+    With ws.Range("B16:C16")
         .Merge
-        If nB > 0 Or nBad > 0 Then
-            .Value = "ALERT: " & nB & " deal(s) with fewer than " & MIN_Q & " counterparties" & IIf(nBad > 0, ", " & nBad & " KEY?", "")
+        If res("nBreach") > 0 Or res("nKey") > 0 Then
+            .Value = "ALERT: " & res("nBreach") & " filled trade(s) with fewer than " & MIN_Q & " counterparties asked" & IIf(res("nKey") > 0, ", " & res("nKey") & " KEY?", "")
             .Interior.Color = RGB(192, 0, 0)
         Else
-            .Value = "OK: all deals with >= " & MIN_Q & " counterparties"
+            .Value = "OK: every filled trade asked at least " & MIN_Q & " counterparties"
             .Interior.Color = RGB(0, 128, 0)
         End If
         .Font.Color = vbWhite: .Font.Bold = True: .HorizontalAlignment = xlCenter
     End With
 
-    '--- distribution ---
+    '--- rule / legend ---
+    ws.Range("E6").Value = "How the check works": ws.Range("E6").Font.Bold = True
+    ws.Range("E7").Value = "'One quote request = the dealer rows whose ID differs only in the last " & ID_SUFFIX_LEN & " characters (FITDNA:6AF5A884011800|03, |05, |06)."
+    ws.Range("E8").Value = "'Asked = distinct dealers on the request, whatever their status (Rejected, C/Cancel and Passed dealers were asked)."
+    ws.Range("E9").Value = "'Quoted = dealers whose row has a price.  Filled = a row whose status matches FILL_STATUS (" & FILL_STATUS & ")."
+    ws.Range("E10").Value = "'BREACH = filled with < " & MIN_Q & " asked.  LOW = not filled with < " & MIN_Q & " asked.  KEY? = one ID with two ISINs / sides / dates."
+    ws.Range("E11").Value = "'Statuses seen in this export: " & res("statuses")
+    ws.Range("E11").Font.Color = RGB(31, 56, 100): ws.Range("E11").Font.Bold = True
+    If Len(res("warnings")) > 0 Then
+        ws.Range("E12").Value = "'Data check: " & res("warnings")
+        ws.Range("E12").Font.Color = RGB(192, 0, 0)
+    End If
+    ws.Range("E7:E12").Font.Size = 9
+
+    '--- distribution of dealers asked ---
     ReDim dist(0 To mx)
-    For i = 1 To m: dist(out(i, 6)) = dist(out(i, 6)) + 1: Next
-    ws.Range("E6:G6").Value = Array("No. counterparties", "No. deals", "% total"): ws.Range("E6:G6").Font.Bold = True
+    For i = 1 To m: dist(out(i, 8)) = dist(out(i, 8)) + 1: Next
+    ws.Range("E14").Value = "Dealers asked": ws.Range("F14").Value = unitWord
+    Hdr ws.Range("E14:F14")
     For q = 0 To mx
-        r = 7 + q
-        ws.Cells(r, 5).Value = q: ws.Cells(r, 6).Value = dist(q): ws.Cells(r, 7).Value = dist(q) / m
-        If q < MIN_Q Then ws.Range(ws.Cells(r, 5), ws.Cells(r, 7)).Interior.Color = RGB(255, 199, 206)
+        ws.Cells(15 + q, 5).Value = q: ws.Cells(15 + q, 6).Value = dist(q)
+        If q < MIN_Q Then ws.Cells(15 + q, 5).Resize(1, 2).Interior.Color = RGB(255, 199, 206)
     Next
-    ws.Range(ws.Cells(7, 7), ws.Cells(7 + mx, 7)).NumberFormat = "0.0%"
+    ws.Range(ws.Cells(15, 6), ws.Cells(15 + mx, 6)).FormatConditions.AddDatabar
 
-    Set co = ws.ChartObjects.Add(ws.Range("I6").Left, ws.Range("I6").Top, 420, 230)
-    With co.Chart
-        .ChartType = xlColumnClustered
-        .SetSourceData ws.Range(ws.Cells(6, 6), ws.Cells(7 + mx, 6))
-        .SeriesCollection(1).XValues = ws.Range(ws.Cells(7, 5), ws.Cells(7 + mx, 5))
-        .HasTitle = True: .ChartTitle.Text = "Counterparties asked per deal"
-        .HasLegend = False
-        For q = 0 To mx
-            If q < MIN_Q Then .SeriesCollection(1).Points(q + 1).Format.Fill.ForeColor.RGB = RGB(192, 0, 0)
-        Next
-    End With
-
-    '--- per-deal lookup (latest run) ---
-    r = Application.WorksheetFunction.Max(15, 9 + mx)
-    ws.Cells(r, 2).Value = "Deal lookup (latest run)": ws.Cells(r, 2).Font.Bold = True: ws.Cells(r, 2).Font.Size = 12
-    ws.Cells(r + 1, 2).Resize(5, 1).Value = Application.Transpose(Array("Deal (TradeKey)", "Security", "No. counterparties", "Counterparties", "Status"))
-    ws.Cells(r + 1, 2).Resize(5, 1).Font.Bold = True
-    With ws.Cells(r + 1, 3)
-        .NumberFormat = "@"
-        .Validation.Add Type:=xlValidateList, Formula1:="='" & SH_DEALS & "'!$B$2:$B$" & (m + 1)
-        .Interior.Color = RGB(255, 242, 204)
-        .Value = GetSheet(SH_DEALS).Range("B2").Value         ' default: worst deal
-    End With
-    lk = "MATCH(" & ws.Cells(r + 1, 3).Address & ",'" & SH_DEALS & "'!$B:$B,0)"
-    ws.Cells(r + 2, 3).Formula = "=IFERROR(INDEX('" & SH_DEALS & "'!$C:$C," & lk & "),"""")"
-    ws.Cells(r + 3, 3).Formula = "=IFERROR(INDEX('" & SH_DEALS & "'!$F:$F," & lk & "),"""")"
-    ws.Cells(r + 4, 3).Formula = "=IFERROR(INDEX('" & SH_DEALS & "'!$I:$I," & lk & "),"""")"
-    ws.Cells(r + 5, 3).Formula = "=IFERROR(INDEX('" & SH_DEALS & "'!$G:$G," & lk & "),"""")"
-    ws.Cells(r + 2, 3).Resize(4, 1).HorizontalAlignment = xlLeft
-
-    '--- history lookup (any date) ---
-    r = r + 7
-    ws.Cells(r, 2).Value = "History lookup (HIST, any date)": ws.Cells(r, 2).Font.Bold = True: ws.Cells(r, 2).Font.Size = 12
-    ws.Cells(r + 1, 2).Resize(5, 1).Value = Application.Transpose(Array("TradeKey (type it)", "Trade date", "No. counterparties", "Counterparties", "Status"))
-    ws.Cells(r + 1, 2).Resize(5, 1).Font.Bold = True
-    ws.Cells(r + 1, 3).NumberFormat = "@": ws.Cells(r + 1, 3).Interior.Color = RGB(255, 242, 204)
-    lk = "MATCH(" & ws.Cells(r + 1, 3).Address & ",'" & SH_HIST & "'!$B:$B,0)"
-    ws.Cells(r + 2, 3).Formula = "=IFERROR(INDEX('" & SH_HIST & "'!$A:$A," & lk & "),"""")"
-    ws.Cells(r + 2, 3).NumberFormat = "yyyy-mm-dd"
-    ws.Cells(r + 3, 3).Formula = "=IFERROR(INDEX('" & SH_HIST & "'!$F:$F," & lk & "),"""")"
-    ws.Cells(r + 4, 3).Formula = "=IFERROR(INDEX('" & SH_HIST & "'!$I:$I," & lk & "),"""")"
-    ws.Cells(r + 5, 3).Formula = "=IFERROR(INDEX('" & SH_HIST & "'!$G:$G," & lk & "),"""")"
-    ws.Cells(r + 2, 3).Resize(4, 1).HorizontalAlignment = xlLeft
-
-    '--- exceptions ---
-    r = r + 7
-    ws.Cells(r, 2).Value = "Exceptions (< " & MIN_Q & " counterparties or KEY?)": ws.Cells(r, 2).Font.Bold = True: ws.Cells(r, 2).Font.Size = 12
-    ws.Range(ws.Cells(r + 1, 2), ws.Cells(r + 1, 8)).Value = Array("TradeKey", "Security", "Side", "Qty", "NDealers", "Status", "Counterparties")
-    ws.Range(ws.Cells(r + 1, 2), ws.Cells(r + 1, 8)).Font.Bold = True
-    q = r + 1
-    For i = 1 To m
-        If out(i, 7) <> "OK" Then
-            q = q + 1
-            ws.Range(ws.Cells(q, 2), ws.Cells(q, 8)).Value = Array("'" & out(i, 2), "'" & out(i, 3), "'" & out(i, 4), out(i, 5), out(i, 6), "'" & out(i, 7), "'" & out(i, 9))
-            ws.Range(ws.Cells(q, 2), ws.Cells(q, 8)).Interior.Color = RGB(255, 199, 206)
-        End If
-    Next
-    If q = r + 1 Then ws.Cells(q + 1, 2).Value = "None."
-
-    '--- recent history (HIST_DAILY) ---
+    '--- recent days ---
     Set hd = GetSheet(SH_HD)
     lr = hd.Cells(hd.Rows.Count, 1).End(xlUp).Row
-    r0 = 23
-    ws.Cells(r0, 9).Value = "Recent history (HIST_DAILY)": ws.Cells(r0, 9).Font.Bold = True: ws.Cells(r0, 9).Font.Size = 12
-    ws.Range(ws.Cells(r0 + 1, 9), ws.Cells(r0 + 1, 13)).Value = Array("Trade date", "Trades", "< " & MIN_Q, "% < " & MIN_Q, "KEY?")
-    ws.Range(ws.Cells(r0 + 1, 9), ws.Cells(r0 + 1, 13)).Font.Bold = True
+    ws.Range("I14:N14").Value = Array("Recent days", "Requests", "Filled", "Breach", "Low", "KEY?")
+    Hdr ws.Range("I14:N14")
+    rr = 14
     If lr >= 2 Then
-        rr = r0 + 1
-        For i = lr To Application.WorksheetFunction.Max(2, lr - 14) Step -1
-            hv = hd.Range(hd.Cells(i, 1), hd.Cells(i, 9)).Value
+        For i = lr To Application.WorksheetFunction.Max(2, lr - 7) Step -1
+            hv = hd.Range(hd.Cells(i, 1), hd.Cells(i, 6)).Value
             rr = rr + 1
-            ws.Cells(rr, 9).Value = hv(1, 1): ws.Cells(rr, 9).NumberFormat = "yyyy-mm-dd"
-            ws.Cells(rr, 10).Value = hv(1, 2): ws.Cells(rr, 11).Value = hv(1, 3)
-            ws.Cells(rr, 12).Value = hv(1, 4): ws.Cells(rr, 12).NumberFormat = "0.0%"
-            ws.Cells(rr, 13).Value = hv(1, 9)
-            If Val(CStr(hv(1, 3))) > 0 Or Val(CStr(hv(1, 9))) > 0 Then ws.Range(ws.Cells(rr, 9), ws.Cells(rr, 13)).Interior.Color = RGB(255, 199, 206)
+            For c = 1 To 6: ws.Cells(rr, 8 + c).Value = hv(1, c): Next
+            ws.Cells(rr, 9).NumberFormat = "yyyy-mm-dd"
+            If Val(CStr(hv(1, 4))) > 0 Then ws.Range(ws.Cells(rr, 9), ws.Cells(rr, 14)).Interior.Color = RGB(255, 199, 206)
         Next
     End If
 
-    ws.Columns("B").ColumnWidth = 36: ws.Columns("C").ColumnWidth = 30
-    ws.Columns("D").ColumnWidth = 8: ws.Columns("E:H").ColumnWidth = 14
-    ws.Columns("I:M").ColumnWidth = 12
-End Sub
-
-Private Sub Stats(out As Variant, ByVal m As Long, nB As Long, nBad As Long, avgQ As Double, mn As Long, mx As Long, t0 As Date, t1 As Date)
-    Dim i As Long, s As Double
-    mn = 1000000: mx = 0: nB = 0: nBad = 0: t0 = 0: t1 = 0
+    '--- requests table ---
+    r = Application.WorksheetFunction.Max(18, 16 + mx, rr) + 2
+    ws.Cells(r, 2).Value = unitWord & " (worst first)": ws.Cells(r, 2).Font.Bold = True: ws.Cells(r, 2).Font.Size = 12
+    r = r + 1
+    ws.Cells(r, 2).Resize(1, 12).Value = Array("Trade date", "Security", "ISIN", "Side", "Qty", "Asked", "Quoted", "Filled", "Winner", "Price", "Check", "Dealers [status @price]")
+    Hdr ws.Cells(r, 2).Resize(1, 12)
+    ReDim tbl(1 To m, 1 To 12)
     For i = 1 To m
-        s = s + out(i, 6)
-        If out(i, 6) < MIN_Q Then nB = nB + 1
-        If out(i, 7) = "KEY?" Then nBad = nBad + 1
-        If out(i, 6) < mn Then mn = out(i, 6)
-        If out(i, 6) > mx Then mx = out(i, 6)
-        If t0 = 0 Or out(i, 1) < t0 Then t0 = out(i, 1)
-        If out(i, 1) > t1 Then t1 = out(i, 1)
+        tbl(i, 1) = out(i, 1): tbl(i, 2) = "'" & out(i, 3): tbl(i, 3) = "'" & out(i, 4): tbl(i, 4) = "'" & out(i, 5)
+        tbl(i, 5) = out(i, 6): tbl(i, 6) = out(i, 8): tbl(i, 7) = out(i, 9): tbl(i, 8) = out(i, 10)
+        tbl(i, 9) = "'" & out(i, 11): tbl(i, 10) = out(i, 12): tbl(i, 11) = out(i, 13): tbl(i, 12) = "'" & out(i, 14)
     Next
-    If m > 0 Then avgQ = s / m
+    ws.Cells(r + 1, 2).Resize(m, 12).Value = tbl
+    ws.Cells(r + 1, 2).Resize(m, 1).NumberFormat = "yyyy-mm-dd"
+    For i = 1 To m
+        rr = r + i
+        Select Case out(i, 13)
+            Case "BREACH"
+                ws.Cells(rr, 2).Resize(1, 12).Interior.Color = RGB(255, 199, 206): ws.Cells(rr, 12).Font.Bold = True
+            Case "KEY?"
+                ws.Cells(rr, 2).Resize(1, 12).Interior.Color = RGB(255, 235, 156)
+            Case "LOW"
+                ws.Cells(rr, 12).Interior.Color = RGB(255, 235, 156)
+            Case "OK"
+                ws.Cells(rr, 12).Interior.Color = RGB(198, 239, 206)
+        End Select
+        If out(i, 9) < MIN_Q Then ws.Cells(rr, 8).Font.Color = RGB(192, 80, 0): ws.Cells(rr, 8).Font.Bold = True
+        If out(i, 10) = "YES" Then ws.Cells(rr, 9).Font.Bold = True
+    Next
+    ws.Cells(r, 2).Resize(m + 1, 12).Borders.Color = RGB(217, 217, 217)
+
+    ws.Columns("B").ColumnWidth = 36: ws.Columns("C").ColumnWidth = 26: ws.Columns("D").ColumnWidth = 14
+    ws.Columns("E").ColumnWidth = 13: ws.Columns("F:I").ColumnWidth = 10: ws.Columns("J").ColumnWidth = 22
+    ws.Columns("K").ColumnWidth = 10: ws.Columns("L").ColumnWidth = 9: ws.Columns("M").ColumnWidth = 110
+    ws.Columns("N").ColumnWidth = 8
 End Sub
 
 '==========================================================================================
 '                                    NOTIFY / LOG
 '==========================================================================================
-' ALERT / ERROR are e-mailed to ALERT_TO and shown as popup when SHOW_POPUPS (never when headless)
 Public Sub Notify(ByVal msg As String, Optional ByVal level As String = "INFO", _
                   Optional ByVal forcePopup As Boolean = False, Optional ByVal noMail As Boolean = False)
     Dim isAlert As Boolean

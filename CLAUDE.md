@@ -400,3 +400,22 @@ End Sub
 4. `DEALER_MAP` aliases (unmapped names are logged after every run).
 5. Compliance answers: `GROUP_LEVEL`, holiday calendar, `BLOT -1` semantics (calendar vs business day), voice trades.
 6. Acceptance: hand-check 5-10 real deals vs the BLOT inquiry detail.
+
+---
+
+## 14. v5 (2026-11-13): lean rebuild on the real BLOT export (supersedes §3-§4, §6, §8 where they differ)
+
+**Real export layout** (one row per DEALER LEG): `Security | Side | Block | Status | Qty (M) | Price | Yield | BrkrName | Net | Curncy | Account | Trade Dt | SetDt | ISIN | Ac/c | Factor | ID`. Statuses seen so far: `Rejected`, `C/Cancel`, `Passed` (a Passed row can carry a price). The status of an executed row is not yet confirmed: `FILL_STATUS` defaults to `done|filled|accepted|traded|executed|complete`; check the "Statuses seen" line on the DASHBOARD.
+
+**Rule (AnalyzeBlot, pure core):**
+- request = rows whose `ID` is equal except the last `ID_SUFFIX_LEN` (2) characters: `FITDNA:6AF5A884011800|03|05|06`. No ID: `date|ISIN|side|qty`.
+- integrity: one ISIN, one side, one trade date per request, else `KEY?`. Cross-check: if every dealer row of the same bond/side/day/qty becomes its own request, a warning says to check `ID_SUFFIX_LEN`.
+- unit = request (`GROUP_LEVEL=INQUIRY`) or all requests for the same date|ISIN|side (`ORDER`; the export has no order id).
+- asked = distinct dealers after `DEALER_MAP` (all statuses count: Rejected / C/Cancel / Passed dealers were asked); quoted = dealers with a price; filled = status matches `FILL_STATUS`, winner = that dealer.
+- check: `BREACH` (filled, asked < MIN_Q) | `LOW` (not filled, asked < MIN_Q) | `KEY?` | `OK`. ALERT e-mail on BREACH / KEY?.
+
+**Export automation (confirmed on the Terminal):** `OPEN_SEQ = KEYS:BLOT 2<GO>|WAIT:3|KEYS:BLOT -1<GO>|WAIT:5`, `EXPORT_SEQ = KEYS:2<GO>|WAIT:2|KEYS:2<GO>|WAIT:3|KEYS:1<GO>|WAIT:5` (Export -> XLS - Excel format -> 1) Export). Bloomberg saves the XLS into `EXPORT_FOLDER`, which is watched (this workbook, `~$` files and `BLOT_########_########_######*` archive copies are excluded). Step engine v5: KEYS (DDE), SEND, WAIT only.
+
+**Workbook:** sheets DASHBOARD, INQUIRIES (latest units), QUOTES (latest legs), PASTE (Ctrl+V + Process Pasted Data), HIST (upsert per TradeDate+Key), HIST_DAILY (recomputed from HIST), CONFIG (24 keys), DEALER_MAP, LOG; TESTS/FIXTURES hidden. Buttons: Run Now, Process Pasted Data, Import File, Test Export, Validate Config, Abort. Removed in v5: README sheet, DEALS/RAW, Outlook/FOLDER source modes, clicks/recorder/calibration, LIST/COUNT/ROWS modes.
+
+**Tests:** synthetic fixtures `tests/fixtures/b1..b3` in the real layout (no real trade data in the public repo); 196 VBA checks; `reference_impl.py` re-implements the rule and matches the VBA unit by unit. Site values: `config/site.local.ini` (git-ignored) -> `dist/BLOT_BestEx_SITE.xlsm`.

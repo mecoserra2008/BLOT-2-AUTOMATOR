@@ -1,0 +1,90 @@
+{
+  "fixture": "b3_pt_semicolon.csv",
+  "default_trade_date": "2026-11-12",
+  "dealer_map": {
+    "BNP PARIB.": "BNP PARIBAS"
+  },
+  "cases": [
+    {
+      "name": "inquiry",
+      "config": {
+        "GROUP_LEVEL": "INQUIRY"
+      },
+      "rerun": true,
+      "expect": {
+        "n_units": 3,
+        "n_filled": 2,
+        "n_breach": 1,
+        "n_low": 1,
+        "hist_rows": 3,
+        "hist_daily_rows": 2,
+        "units": [
+          {
+            "key": "INQ:FITDNA:IIII00000001I0",
+            "date": "2026-11-12",
+            "requests": 1,
+            "asked": 2,
+            "quoted": 0,
+            "filled": "NO",
+            "winner": "",
+            "check": "LOW"
+          },
+          {
+            "key": "INQ:FITDNA:IIII00000002I0",
+            "date": "2026-11-12",
+            "requests": 1,
+            "asked": 2,
+            "quoted": 2,
+            "filled": "YES",
+            "winner": "DEALER THREE",
+            "check": "BREACH"
+          },
+          {
+            "key": "INQ:FITDNA:JJJJ00000000J0",
+            "date": "2026-11-13",
+            "requests": 1,
+            "asked": 3,
+            "quoted": 3,
+            "filled": "YES",
+            "winner": "DEALER ONE",
+            "check": "OK"
+          }
+        ]
+      }
+    },
+    {
+      "name": "order",
+      "config": {
+        "GROUP_LEVEL": "ORDER"
+      },
+      "expect": {
+        "n_units": 2,
+        "n_requests": 3,
+        "n_breach": 0,
+        "n_low": 0,
+        "units": [
+          {
+            "key": "ORD:2026-11-12|XS0000000091|B",
+            "date": "2026-11-12",
+            "requests": 2,
+            "asked": 4,
+            "quoted": 2,
+            "filled": "YES",
+            "winner": "DEALER THREE",
+            "check": "OK"
+          },
+          {
+            "key": "ORD:2026-11-13|XS0000000099|S",
+            "date": "2026-11-13",
+            "requests": 1,
+            "asked": 3,
+            "quoted": 3,
+            "filled": "YES",
+            "winner": "DEALER ONE",
+            "check": "OK"
+          }
+        ]
+      }
+    }
+  ]
+}
