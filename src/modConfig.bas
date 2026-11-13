@@ -31,13 +31,14 @@ Private Const HOLIDAY_REF  As String = "I5:I400"
 '------------------------------------ CONFIG VALUES --------------------------------------
 Public BBG_PANEL As String, BBG_TITLE_PREFIX As String, OPEN_SEQ As String, EXPORT_SEQ As String
 Public EXPORT_FOLDER As String, ARCHIVE_DIR As String, TIMEOUT_S As Long, POLL_S As Long
-Public RUN_AT As String, ALERT_TO As String, SHOW_POPUPS As Boolean
+Public RUN_AT As String, ALERT_TO As String, SHOW_POPUPS As Boolean, SCHEDULE_MODE As String, RETRY_MIN As Long
 Public MIN_Q As Long, GROUP_LEVEL As String, FILL_STATUS As String, ID_SUFFIX_LEN As Long, DATE_FORMAT_TEXT As String
 Public HDR_DEALER As String, HDR_ID As String, HDR_SECURITY As String, HDR_ISIN As String, HDR_SIDE As String
 Public HDR_STATUS As String, HDR_QTY As String, HDR_PRICE As String, HDR_DATE As String
 
 ' fixed (no longer on CONFIG)
 Public Const STEP_GAP_S As Double = 0.7
+Public Const TASK_NAME As String = "BLOT Best Execution"
 Public Const TEST_EXPORT_RUNS As Long = 5
 
 Public HolidaySet As Object          ' Long(date serial) -> 1
@@ -62,7 +63,9 @@ Private Sub BuildDefs()
     AddDef "BLOOMBERG", "POLL_S", "3", "Seconds between checks for the export.", ""
 
     AddDef "RUN", "ARCHIVE_DIR", "", "Folder for a dated copy of every export (regulatory evidence). Created if missing. Keep it different from EXPORT_FOLDER.", "U"
-    AddDef "RUN", "RUN_AT", "08:30:00", "Daily run time. The workbook must be open. Weekends and the holidays in column I are skipped.", ""
+    AddDef "RUN", "RUN_AT", "08:30:00", "Daily run time (weekdays; the holidays in column I are skipped).", ""
+    AddDef "RUN", "SCHEDULE_MODE", "WORKBOOK", "TASK = Windows Task Scheduler opens Excel and runs at RUN_AT (button 'Install Daily Task') | WORKBOOK = runs at RUN_AT while this workbook is open | OFF.", "U"
+    AddDef "RUN", "RETRY_MIN", "10", "Scheduled run only: minutes before ONE retry when Bloomberg did not export (0 = no retry).", ""
     AddDef "RUN", "ALERT_TO", "", "E-mail recipients (';'-separated) for alerts, timeouts and errors. Empty = no e-mail.", "U"
     AddDef "RUN", "SHOW_POPUPS", "FALSE", "TRUE = popup on alerts (blocks Excel until dismissed: keep FALSE for unattended runs).", ""
 
@@ -122,6 +125,8 @@ Public Sub ApplyConfig(ByVal d As Object)
     POLL_S = CLng(CfgNum(d, "POLL_S"))
     ARCHIVE_DIR = StripSlash(CfgStr(d, "ARCHIVE_DIR"))
     RUN_AT = CfgStr(d, "RUN_AT")
+    SCHEDULE_MODE = UCase$(CfgStr(d, "SCHEDULE_MODE"))
+    RETRY_MIN = CLng(CfgNum(d, "RETRY_MIN"))
     ALERT_TO = CfgStr(d, "ALERT_TO")
     SHOW_POPUPS = CfgBool(d, "SHOW_POPUPS")
     MIN_Q = CLng(CfgNum(d, "MIN_Q"))
@@ -263,7 +268,7 @@ Public Sub WriteConfigSheet()
     ws.Columns(7).ColumnWidth = 70: ws.Columns(8).ColumnWidth = 2
     ws.Columns(9).ColumnWidth = 12: ws.Columns(10).ColumnWidth = 36
     WriteHolidayTable ws, hol, nHol
-    AddSheetButtons ws, Array("Validate Config|ValidateConfig", "Test Export|TestExport", "Run Now|RunBlotReport")
+    AddSheetButtons ws, Array("Validate Config|ValidateConfig", "Test Export|TestExport", "Install Daily Task|InstallDailyTask", "Remove Daily Task|RemoveDailyTask")
 End Sub
 
 Public Sub Hdr(rg As Range)
@@ -457,6 +462,17 @@ Public Function ValidateConfigCore(Optional ByRef nFail As Long, Optional ByRef 
     End If
 
     If ParseTimeStr(RUN_AT, t) Then VAdd res, "RUN_AT", "PASS", Format$(t, "hh:nn:ss") Else VAdd res, "RUN_AT", "FAIL", "'" & RUN_AT & "' is not hh:mm[:ss]."
+    Select Case SCHEDULE_MODE
+        Case "TASK"
+            If TaskExists() Then VAdd res, "SCHEDULE_MODE", "PASS", "TASK: Windows task '" & TASK_NAME & "' installed." Else VAdd res, "SCHEDULE_MODE", "FAIL", "TASK but the Windows task is not installed: click Install Daily Task."
+        Case "WORKBOOK"
+            VAdd res, "SCHEDULE_MODE", "WARN", "WORKBOOK: runs only while this workbook stays open. Install Daily Task for a fully unattended run."
+        Case "OFF"
+            VAdd res, "SCHEDULE_MODE", "WARN", "OFF: no scheduled run."
+        Case Else
+            VAdd res, "SCHEDULE_MODE", "FAIL", "'" & SCHEDULE_MODE & "' is not TASK | WORKBOOK | OFF."
+    End Select
+    If ThisWorkbook.ReadOnly Then VAdd res, "Workbook", "FAIL", "Opened read-only: history cannot be saved." Else VAdd res, "Workbook", "PASS", ThisWorkbook.FullName
     If POLL_S < 1 Or TIMEOUT_S <= POLL_S Then VAdd res, "TIMEOUT_S / POLL_S", "FAIL", "Need POLL_S >= 1 and TIMEOUT_S > POLL_S." Else VAdd res, "TIMEOUT_S / POLL_S", "PASS", TIMEOUT_S & "s / " & POLL_S & "s"
     If Len(ALERT_TO) = 0 Then VAdd res, "ALERT_TO", "WARN", "No e-mail alerts." Else VAdd res, "ALERT_TO", "PASS", ALERT_TO
     If SHOW_POPUPS Then VAdd res, "SHOW_POPUPS", "WARN", "TRUE blocks unattended runs until dismissed." Else VAdd res, "SHOW_POPUPS", "PASS", "FALSE"

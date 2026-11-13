@@ -13,7 +13,8 @@ Option Explicit
 '   quoted   = distinct dealers whose row has a price
 '   filled   = a row whose status matches FILL_STATUS (winner = that dealer)
 '   check    = BREACH (filled, asked < MIN_Q) | LOW (not filled, asked < MIN_Q) | KEY? | OK
-' Buttons: Run Now, Process Pasted Data, Import File, Test Export, Validate Config, Abort
+' One button: RUN BLOT CHECK (Bloomberg -> export -> analysis -> dashboard -> history saved)
+' Daily: SCHEDULE_MODE = TASK (Windows Task Scheduler, button Install Daily Task) or WORKBOOK (OnTime)
 '==========================================================================================
 
 '------------------------------------ WIN32 ----------------------------------------------
@@ -48,20 +49,32 @@ Private gT0 As Date, gSince As Date, gDeadline As Date, gNextRun As Date, gSched
 Private gKnown As String, gCandKey As String, gCandRows As Long, gBusy As Boolean, gKind As String
 Private gPollAt As Date, gPollPending As Boolean, gCycleAt As Date, gCyclePending As Boolean
 Private gTestN As Long, gTestI As Long, gTestOK As Long, gLastErr As String, gWarned As String
+Private gScheduled As Boolean, gRetried As Boolean, gRetryAt As Date, gRetryPending As Boolean, gLastOK As Boolean
 
 '==========================================================================================
 '                                    ENTRY POINTS
 '==========================================================================================
 Public Sub RunBlotReport()
+    gScheduled = False
+    StartRun
+End Sub
+
+Private Sub StartRun()
     On Error GoTo EH
     LoadConfig
     If Not BeginRun("RUN") Then Exit Sub
-    Notify "Run started: expected trade date " & Format$(PrevBusinessDay(Date), "yyyy-mm-dd") & ".", LV_INFO
-    If Not StartAcquisition() Then FinishRun
+    gLastOK = False
+    Notify "Run started" & IIf(gScheduled, " (scheduled)", "") & ": expected trade date " & Format$(PrevBusinessDay(Date), "yyyy-mm-dd") & ".", LV_INFO
+    If Not StartAcquisition() Then
+        FinishRun
+        SetStatus "FAILED: could not drive Bloomberg (see LOG).", True
+        MaybeRetry
+    End If
     Exit Sub
 EH:
     FinishRun
     Notify "ERROR in RunBlotReport: " & Err.Description, LV_ERROR
+    MaybeRetry
 End Sub
 
 Public Sub PollExport()
@@ -81,6 +94,7 @@ End Sub
 
 Public Sub AbortRun()
     CancelPending
+    CancelRetry
     gBusy = False: gKind = ""
     Application.StatusBar = False
     Notify "Run aborted by the operator.", LV_WARN, False, True
@@ -266,7 +280,7 @@ Private Function IsOwnSheet(ByVal nm As String) As Boolean
 End Function
 
 Public Function DashButtons() As Variant
-    DashButtons = Array("Run Now|RunBlotReport", "Process Pasted Data|ProcessPasted", "Import File|ImportFromFile", _
+    DashButtons = Array("RUN BLOT CHECK|RunBlotReport|MAIN", "Process Pasted Data|ProcessPasted", "Import File|ImportFromFile", _
                         "Test Export|TestExport", "Validate Config|ValidateConfig", "Abort|AbortRun")
 End Function
 
@@ -279,12 +293,28 @@ Public Sub AddSheetButtons(ws As Worksheet, defs As Variant)
     x = 6
     For i = LBound(defs) To UBound(defs)
         p = Split(defs(i), "|")
-        Set b = ws.Buttons.Add(x, 4, 128, 26)
-        b.OnAction = p(1)
-        b.Caption = p(0)
-        b.Name = "btn_" & p(1)
-        b.Placement = xlFreeFloating
-        x = x + 134
+        If UBound(p) >= 2 Then                                ' main action: big green shape
+            Set b = ws.Shapes.AddShape(5, x, 3, 190, 28)      ' msoShapeRoundedRectangle
+            b.Fill.ForeColor.RGB = RGB(0, 128, 0)
+            b.Line.Visible = False
+            With b.TextFrame2.TextRange
+                .Text = p(0)
+                .Font.Bold = True: .Font.Size = 12: .Font.Fill.ForeColor.RGB = RGB(255, 255, 255)
+                .ParagraphFormat.Alignment = 2                ' centre
+            End With
+            b.TextFrame2.VerticalAnchor = 3
+            b.OnAction = p(1)
+            b.Name = "btn_" & p(1)
+            b.Placement = xlFreeFloating
+            x = x + 198
+        Else
+            Set b = ws.Buttons.Add(x, 4, 118, 26)
+            b.OnAction = p(1)
+            b.Caption = p(0)
+            b.Name = "btn_" & p(1)
+            b.Placement = xlFreeFloating
+            x = x + 124
+        End If
     Next
 End Sub
 
@@ -296,6 +326,7 @@ Public Sub ScheduleDaily()
     On Error GoTo EH
     LoadConfig
     CancelSchedule
+    If SCHEDULE_MODE <> "WORKBOOK" Then Exit Sub                  ' TASK: Windows starts the run; OFF: nothing
     If Not ParseTimeStr(RUN_AT, t) Then Notify "Scheduler NOT armed: RUN_AT '" & RUN_AT & "' is not hh:mm[:ss].", LV_ERROR: Exit Sub
     gNextRun = Date + t
     If gNextRun <= Now Then gNextRun = gNextRun + 1
@@ -307,17 +338,147 @@ EH:
     Notify "ERROR in ScheduleDaily: " & Err.Description, LV_ERROR
 End Sub
 
+' Called at RUN_AT by the OnTime scheduler or by the Windows task (BLOT_RunDaily.vbs). Runs at most once a day.
 Public Sub ScheduledRun()
     gSchedPending = False
     On Error Resume Next
     LoadConfig
-    If IsBusinessDay(Date) Then
-        RunBlotReport
-    Else
+    If Not IsBusinessDay(Date) Then
         WriteLog "Scheduled run skipped: " & Format$(Date, "yyyy-mm-dd") & " is not a business day.", LV_INFO
+    ElseIf LastOkRunDate() = CLng(Date) Then
+        WriteLog "Scheduled run skipped: today's run already completed.", LV_INFO
+    Else
+        gScheduled = True: gRetried = False
+        StartRun
     End If
     ScheduleDaily
 End Sub
+
+Public Sub ScheduledRetry()
+    gRetryPending = False
+    LoadConfig
+    If LastOkRunDate() = CLng(Date) Then Exit Sub
+    gScheduled = True: gRetried = True
+    WriteLog "Scheduled run: retry.", LV_INFO
+    StartRun
+End Sub
+
+Private Sub MaybeRetry()
+    If Not gScheduled Or gRetried Or RETRY_MIN <= 0 Then Exit Sub
+    gRetryAt = Now + TimeSerial(0, RETRY_MIN, 0)
+    Application.OnTime gRetryAt, ProcName("ScheduledRetry")
+    gRetryPending = True
+    WriteLog "Scheduled run failed: one retry at " & Format$(gRetryAt, "hh:nn") & ".", LV_WARN
+End Sub
+
+' ThisWorkbook.BeforeClose: no timer may reopen the workbook later
+Public Sub OnWorkbookClose()
+    CancelSchedule
+    CancelRetry
+    CancelPending
+End Sub
+
+Private Sub CancelRetry()
+    On Error Resume Next
+    If gRetryPending Then Application.OnTime gRetryAt, ProcName("ScheduledRetry"), , False
+    gRetryPending = False
+End Sub
+
+Private Function LastOkRunDate() As Long
+    On Error Resume Next
+    LastOkRunDate = CLng(Val(Mid$(ThisWorkbook.Names("BLOT_LAST_OK").RefersTo, 2)))
+End Function
+
+Private Sub SetLastOkRun()
+    On Error Resume Next
+    ThisWorkbook.Names.Add Name:="BLOT_LAST_OK", RefersTo:="=" & CLng(Date), Visible:=False
+End Sub
+
+'==========================================================================================
+'                                    WINDOWS TASK (unattended daily run)
+'==========================================================================================
+' Writes BLOT_RunDaily.vbs next to the workbook and registers a weekday task at RUN_AT that runs it.
+' The script opens Excel and this workbook if needed and calls ScheduledRun (once a day, holidays skipped).
+Public Sub InstallDailyTask()
+    Dim t As Date, vbs As String, ps As String, h As Integer, ok As Boolean, msg As String
+    On Error GoTo EH
+    LoadConfig
+    If Len(ThisWorkbook.Path) = 0 Then MsgBox "Save the workbook first.", vbExclamation: Exit Sub
+    If Not ParseTimeStr(RUN_AT, t) Then MsgBox "RUN_AT is not hh:mm[:ss].", vbExclamation: Exit Sub
+    ThisWorkbook.Save
+    vbs = ThisWorkbook.Path & "\BLOT_RunDaily.vbs"
+    h = FreeFile: Open vbs For Output As #h: Print #h, TaskScriptText(ThisWorkbook.FullName); Close #h
+    ps = Environ$("TEMP") & "lot_install_task.ps1"
+    h = FreeFile: Open ps For Output As #h
+    Print #h, "$a = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument '""" & vbs & """'"
+    Print #h, "$t = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At '" & Format$(t, "hh:nn") & "'"
+    Print #h, "$s = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 1)"
+    Print #h, "Register-ScheduledTask -TaskName '" & TASK_NAME & "' -Action $a -Trigger $t -Settings $s -Description 'BLOT best-execution check (Excel)' -Force | Out-Null"
+    Close #h
+    ok = (ShellWait("powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File """ & ps & """") = 0) And TaskExists()
+    If Not ok Then                                            ' fallback when PowerShell scheduling is blocked
+        ok = (ShellWait("schtasks.exe /Create /F /TN """ & TASK_NAME & """ /SC WEEKLY /D MON,TUE,WED,THU,FRI /ST " & Format$(t, "hh:nn") & _
+                        " /TR ""wscript.exe """ & vbs & """""") = 0) And TaskExists()
+    End If
+    On Error Resume Next: Kill ps: On Error GoTo EH
+    If ok Then
+        SetConfigValue "SCHEDULE_MODE", "TASK"
+        CancelSchedule
+        msg = "Daily task '" & TASK_NAME & "' installed: weekdays at " & Format$(t, "hh:nn") & " (missed runs start when the PC is back on)." & vbLf & _
+              "Script: " & vbs & vbLf & "Keep Windows logged on with Bloomberg running. SCHEDULE_MODE set to TASK."
+        Notify msg, LV_INFO, True, True
+    Else
+        Notify "Could not create the Windows task (blocked by policy?). Keep SCHEDULE_MODE = WORKBOOK and leave the workbook open, or ask IT to schedule: wscript.exe """ & vbs & """", LV_ERROR, True, True
+    End If
+    Exit Sub
+EH:
+    Notify "ERROR in InstallDailyTask: " & Err.Description, LV_ERROR, True, True
+End Sub
+
+Public Sub RemoveDailyTask()
+    On Error Resume Next
+    LoadConfig
+    ShellWait "schtasks.exe /Delete /F /TN """ & TASK_NAME & """"
+    If TaskExists() Then
+        Notify "Could not remove the task '" & TASK_NAME & "'.", LV_ERROR, True, True
+    Else
+        SetConfigValue "SCHEDULE_MODE", "WORKBOOK"
+        ScheduleDaily
+        Notify "Daily task removed. SCHEDULE_MODE set to WORKBOOK (runs while this workbook is open).", LV_INFO, True, True
+    End If
+End Sub
+
+Public Function TaskExists() As Boolean
+    TaskExists = (ShellWait("schtasks.exe /Query /TN """ & TASK_NAME & """") = 0)
+End Function
+
+Public Function TaskScriptText(ByVal wbPath As String) As String
+    Dim s As String
+    s = "' BLOT Best Execution - started daily by Windows Task Scheduler (created by Install Daily Task)" & vbCrLf
+    s = s & "Option Explicit" & vbCrLf
+    s = s & "Dim xl, wb, w, p" & vbCrLf
+    s = s & "p = """ & wbPath & """" & vbCrLf
+    s = s & "On Error Resume Next" & vbCrLf
+    s = s & "Set xl = GetObject(, ""Excel.Application"")" & vbCrLf
+    s = s & "If Err.Number <> 0 Then Err.Clear: Set xl = CreateObject(""Excel.Application"")" & vbCrLf
+    s = s & "On Error GoTo 0" & vbCrLf
+    s = s & "xl.Visible = True: xl.UserControl = True" & vbCrLf
+    s = s & "Set wb = Nothing" & vbCrLf
+    s = s & "For Each w In xl.Workbooks" & vbCrLf
+    s = s & "    If LCase(w.FullName) = LCase(p) Then Set wb = w" & vbCrLf
+    s = s & "Next" & vbCrLf
+    s = s & "If wb Is Nothing Then Set wb = xl.Workbooks.Open(p)" & vbCrLf
+    s = s & "xl.Run ""'"" & wb.Name & ""'!ScheduledRun""" & vbCrLf
+    TaskScriptText = s
+End Function
+
+Private Function ShellWait(ByVal cmd As String) As Long
+    On Error GoTo Fail
+    ShellWait = CreateObject("WScript.Shell").Run(cmd, 0, True)
+    Exit Function
+Fail:
+    ShellWait = -1
+End Function
 
 Public Sub CancelSchedule()
     On Error Resume Next
@@ -372,9 +533,11 @@ Private Function StartAcquisition() As Boolean
     gKnown = SnapshotWorkbooks()
     gSince = gT0
     If Len(EXPORT_SEQ) = 0 Then Notify "EXPORT_SEQ is empty on CONFIG.", LV_ERROR: Exit Function
+    SetStatus "1/3 Opening BLOT in Bloomberg...", False
     If Not RunSteps(ExpandSeq(OPEN_SEQ, Date)) Then Notify "OPEN_SEQ failed: could not drive the Bloomberg Terminal.", LV_ERROR: Exit Function
+    SetStatus "2/3 Exporting the BLOT grid (XLS)...", False
     If Not RunSteps(ExpandSeq(EXPORT_SEQ, Date)) Then Notify "EXPORT_SEQ failed.", LV_ERROR: Exit Function
-    Application.StatusBar = "BLOT: waiting for the export..."
+    SetStatus "3/3 Waiting for the export file...", False
     SchedulePoll
     StartAcquisition = True
 End Function
@@ -389,6 +552,8 @@ Private Sub OnAcquireTimeout()
     Else
         FinishRun
         Notify msg, LV_ALERT
+        SetStatus "FAILED: " & msg, True
+        MaybeRetry
     End If
 End Sub
 
@@ -398,6 +563,7 @@ Private Sub HandleExport(v As Variant, vRaw As Variant, ByVal label As String, B
     Else
         ProcessData v, vRaw, label, srcWb, srcFile
         FinishRun
+        ShowDashboard
     End If
 End Sub
 
@@ -425,9 +591,40 @@ End Sub
 '==========================================================================================
 '                                    SOURCES
 '==========================================================================================
+' The export is either a new workbook (any Excel instance) or a new XLS file in a watched folder
 Private Function TryAcquire() As Boolean
+    Dim fo As Variant, f As String
     If TryNewWorkbooks() Then TryAcquire = True: Exit Function
-    If Len(EXPORT_FOLDER) > 0 Then TryAcquire = TryFile(NewestFileSince(EXPORT_FOLDER, gSince))
+    For Each fo In WatchFolders()
+        f = NewestFileSince(CStr(fo), gSince)
+        If Len(f) > 0 Then
+            If TryFile(f) Then
+                If StrComp(CStr(fo), EXPORT_FOLDER, vbTextCompare) <> 0 Then
+                    On Error Resume Next
+                    SetConfigValue "EXPORT_FOLDER", CStr(fo)
+                    On Error GoTo 0
+                    WriteLog "Export found in " & fo & ": saved as EXPORT_FOLDER.", LV_INFO
+                End If
+                TryAcquire = True
+                Exit Function
+            End If
+        End If
+    Next
+End Function
+
+' EXPORT_FOLDER first, then the usual places Bloomberg saves an export
+Private Function WatchFolders() As Collection
+    Dim c As New Collection, f As Variant, seen As Object, k As String
+    Set seen = NewDict()
+    For Each f In Array(EXPORT_FOLDER, ThisWorkbook.Path, Environ$("USERPROFILE") & "\Downloads", _
+                        Environ$("USERPROFILE") & "\Documents", "C:\blp\data", "C:\blp\Export")
+        k = LCase$(CStr(f))
+        If Len(k) > 0 And Not seen.Exists(k) Then
+            seen(k) = 1
+            If Len(Dir$(CStr(f), vbDirectory)) > 0 Then c.Add CStr(f)
+        End If
+    Next
+    Set WatchFolders = c
 End Function
 
 Private Function TryNewWorkbooks() As Boolean
@@ -1437,6 +1634,9 @@ Private Function ProcessData(v As Variant, vRaw As Variant, ByVal srcLabel As St
         Notify "OK " & msg, LV_INFO
     End If
     If Len(gaps) > 0 Then Notify "ALERT coverage gap: no BLOT data for business day(s) " & gaps & ". Load them with Import File.", LV_ALERT
+    SetStatus "DONE " & Format$(Now, "hh:nn") & ": " & m & " request(s), " & res("nFilled") & " filled, " & res("nBreach") & " BREACH, " & res("nLow") & " LOW.", res("nBreach") > 0
+    If gKind = "RUN" Then SetLastOkRun
+    SaveHistory
     ProcessData = True
     Exit Function
 EH:
@@ -1865,6 +2065,40 @@ Public Function GetSheet(ByVal nm As String) As Worksheet
         GetSheet.Name = nm
     End If
 End Function
+
+' Saves the workbook so the history survives (unattended runs never prompt)
+Private Sub SaveHistory()
+    Dim da As Boolean
+    On Error GoTo EH
+    If ThisWorkbook.ReadOnly Then WriteLog "Workbook is read-only: history NOT saved.", LV_ERROR: Exit Sub
+    da = Application.DisplayAlerts: Application.DisplayAlerts = False
+    ThisWorkbook.Save
+    Application.DisplayAlerts = da
+    Exit Sub
+EH:
+    Application.DisplayAlerts = True
+    Notify "ERROR saving the workbook (history not saved): " & Err.Description, LV_ERROR
+End Sub
+
+' Progress line on the DASHBOARD (row 2) and in the status bar
+Private Sub SetStatus(ByVal msg As String, ByVal isBad As Boolean)
+    On Error Resume Next
+    With GetSheet(SH_DASH).Range("B2")
+        .Value = "'" & msg
+        .Font.Bold = True
+        .Font.Color = IIf(isBad, RGB(192, 0, 0), RGB(31, 56, 100))
+    End With
+    Application.StatusBar = "BLOT: " & msg
+    DoEvents
+End Sub
+
+Private Sub ShowDashboard()
+    On Error Resume Next
+    ThisWorkbook.Activate
+    GetSheet(SH_DASH).Activate
+    GetSheet(SH_DASH).Range("A1").Select
+    If Application.Visible Then AppActivate Application.Caption
+End Sub
 
 Public Function NewDict() As Object
     Set NewDict = CreateObject("Scripting.Dictionary")

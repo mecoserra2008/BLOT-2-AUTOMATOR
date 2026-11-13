@@ -5,5 +5,5 @@ Private Sub Workbook_Open()
 End Sub
 
 Private Sub Workbook_BeforeClose(Cancel As Boolean)
-    CancelSchedule
+    OnWorkbookClose
 End Sub

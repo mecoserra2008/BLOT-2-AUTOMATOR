@@ -356,6 +356,12 @@ Private Sub UnitTests()
     Check "unit", "steps", "clicks no longer supported", "True", B2S(Len(ValidateSteps("CLICK:10,20")) > 0)
     Check "unit", "steps", "bad wait rejected", "True", B2S(Len(ValidateSteps("WAIT:x")) > 0)
 
+    '--- scheduling ---
+    Check "unit", "schedule", "default SCHEDULE_MODE", "WORKBOOK", SCHEDULE_MODE
+    s = TaskScriptText("M:\BLOT\BLOT_BestEx.xlsm")
+    Check "unit", "schedule", "task script opens the workbook", "True", B2S(InStr(1, s, "p = ""M:\BLOT\BLOT_BestEx.xlsm""") > 0)
+    Check "unit", "schedule", "task script calls ScheduledRun", "True", B2S(InStr(1, s, "!ScheduledRun") > 0)
+
     '--- headers of the real BLOT export ---
     a = HdrRow(Array("Security", "Side", "Block", "Status", "Qty (M)", "Price", "Yield", "BrkrName", "Net", "Curncy", "Account", "Trade Dt", "SetDt", "ISIN", "Ac/c", "Factor", "ID"))
     Check "unit", "headers", "dealer = BrkrName", "8", CStr(HeaderIndex(a, HDR_DEALER))
