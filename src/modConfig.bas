@@ -30,7 +30,7 @@ Private Const HOLIDAY_REF  As String = "I5:I400"
 
 '------------------------------------ CONFIG VALUES --------------------------------------
 Public BBG_PANEL As String, BBG_TITLE_PREFIX As String, OPEN_SEQ As String, EXPORT_SEQ As String
-Public EXPORT_FOLDER As String, ARCHIVE_DIR As String, TIMEOUT_S As Long, POLL_S As Long
+Public EXPORT_FOLDER As String, TIMEOUT_S As Long, POLL_S As Long
 Public RUN_AT As String, ALERT_TO As String, SHOW_POPUPS As Boolean, SCHEDULE_MODE As String, RETRY_MIN As Long
 Public MIN_Q As Long, GROUP_LEVEL As String, FILL_STATUS As String, ID_SUFFIX_LEN As Long, DATE_FORMAT_TEXT As String
 Public HDR_DEALER As String, HDR_ID As String, HDR_SECURITY As String, HDR_ISIN As String, HDR_SIDE As String
@@ -57,13 +57,12 @@ Private Sub BuildDefs()
     AddDef "BLOOMBERG", "BBG_PANEL", "<blp-1>", "Bloomberg panel used for the DDE keystrokes.", ""
     AddDef "BLOOMBERG", "BBG_TITLE_PREFIX", "1-BLOOMBERG", "Start of the panel window title (only needed for SEND: steps).", ""
     AddDef "BLOOMBERG", "OPEN_SEQ", "KEYS:BLOT 2<GO>|WAIT:3|KEYS:BLOT -1<GO>|WAIT:5", "Opens the BLOT of the previous day. KEYS:text<GO> | SEND:keys | WAIT:s. {DAYS_BACK} = days to the previous business day.", ""
-    AddDef "BLOOMBERG", "EXPORT_SEQ", "KEYS:2<GO>|WAIT:2|KEYS:2<GO>|WAIT:3|FOCUS:Export Blotter|SEND:1~|WAIT:5 || KEYS:2<GO>|WAIT:2|KEYS:2<GO>|WAIT:3|FOCUS:Export Blotter|SEND:~|WAIT:5", _
-           "Export: 2<GO> Export, 2<GO> 'XLS - Excel format', then the Export Blotter dialog is brought to the front and '1) Export' pressed (1 + GO). Variants after || are tried if no file arrives; the one that works moves first.", ""
-    AddDef "BLOOMBERG", "EXPORT_FOLDER", "", "Folder where Bloomberg saves the exported XLS (watched during the run). Empty = only exports that open in Excel.", "U"
+    AddDef "BLOOMBERG", "EXPORT_SEQ", "KEYS:2<GO>|WAIT:2|KEYS:2<GO>|WAIT:3|KEYS:1<GO>|WAIT:5", _
+           "Export through DDE: 2<GO> Export, 2<GO> 'XLS - Excel format', 1<GO> '1) Export' in the Export Blotter dialog.", ""
+    AddDef "BLOOMBERG", "EXPORT_FOLDER", "", "Folder where every BLOT export is SAVED by the workbook (BLOT_<tradedate>_<timestamp>.xls*, regulatory evidence). Also watched for Bloomberg's own XLS.", "U"
     AddDef "BLOOMBERG", "TIMEOUT_S", "300", "Seconds to wait for the export before a TIMEOUT alert.", ""
     AddDef "BLOOMBERG", "POLL_S", "3", "Seconds between checks for the export.", ""
 
-    AddDef "RUN", "ARCHIVE_DIR", "", "Folder for a dated copy of every export (regulatory evidence). Created if missing. Keep it different from EXPORT_FOLDER.", "U"
     AddDef "RUN", "RUN_AT", "08:30:00", "Daily run time (weekdays; the holidays in column I are skipped).", ""
     AddDef "RUN", "SCHEDULE_MODE", "WORKBOOK", "TASK = Windows Task Scheduler opens Excel and runs at RUN_AT (button 'Install Daily Task') | WORKBOOK = runs at RUN_AT while this workbook is open | OFF.", "U"
     AddDef "RUN", "RETRY_MIN", "10", "Scheduled run only: minutes before ONE retry when Bloomberg did not export (0 = no retry).", ""
@@ -124,7 +123,6 @@ Public Sub ApplyConfig(ByVal d As Object)
     EXPORT_FOLDER = StripSlash(CfgStr(d, "EXPORT_FOLDER"))
     TIMEOUT_S = CLng(CfgNum(d, "TIMEOUT_S"))
     POLL_S = CLng(CfgNum(d, "POLL_S"))
-    ARCHIVE_DIR = StripSlash(CfgStr(d, "ARCHIVE_DIR"))
     RUN_AT = CfgStr(d, "RUN_AT")
     SCHEDULE_MODE = UCase$(CfgStr(d, "SCHEDULE_MODE"))
     RETRY_MIN = CLng(CfgNum(d, "RETRY_MIN"))
@@ -441,26 +439,13 @@ Public Function ValidateConfigCore(Optional ByRef nFail As Long, Optional ByRef 
     If Len(EXPORT_SEQ) = 0 Then e = "Empty."
     If Len(e) > 0 Then VAdd res, "EXPORT_SEQ", "FAIL", e Else VAdd res, "EXPORT_SEQ", "PASS", EXPORT_SEQ & " (confirm with Test Export 5/5)"
     If DdeAvailable(msg) Then VAdd res, "DDE link", "PASS", msg Else VAdd res, "DDE link", "FAIL", msg
-    If BbgHwnd() = 0 Then VAdd res, "Bloomberg window", "WARN", "Not found (needed to press keys in the Export Blotter dialog). Terminal open?" Else VAdd res, "Bloomberg window", "PASS", "Found."
 
     If Len(EXPORT_FOLDER) = 0 Then
-        VAdd res, "EXPORT_FOLDER", "WARN", "Empty: only exports that open in Excel are detected."
+        VAdd res, "EXPORT_FOLDER", "FAIL", "Required: folder where every export is saved."
     Else
+        EnsureFolder EXPORT_FOLDER
         e = FolderProblem(EXPORT_FOLDER)
         If Len(e) > 0 Then VAdd res, "EXPORT_FOLDER", "FAIL", e Else VAdd res, "EXPORT_FOLDER", "PASS", EXPORT_FOLDER
-    End If
-    If Len(ARCHIVE_DIR) = 0 Then
-        VAdd res, "ARCHIVE_DIR", "FAIL", "Required (regulatory evidence)."
-    Else
-        EnsureFolder ARCHIVE_DIR
-        e = FolderProblem(ARCHIVE_DIR)
-        If Len(e) > 0 Then
-            VAdd res, "ARCHIVE_DIR", "FAIL", e
-        ElseIf StrComp(ARCHIVE_DIR, EXPORT_FOLDER, vbTextCompare) = 0 Then
-            VAdd res, "ARCHIVE_DIR", "WARN", "Same folder as EXPORT_FOLDER: use a subfolder (e.g. ...\ARCHIVE)."
-        Else
-            VAdd res, "ARCHIVE_DIR", "PASS", ARCHIVE_DIR
-        End If
     End If
 
     If ParseTimeStr(RUN_AT, t) Then VAdd res, "RUN_AT", "PASS", Format$(t, "hh:nn:ss") Else VAdd res, "RUN_AT", "FAIL", "'" & RUN_AT & "' is not hh:mm[:ss]."

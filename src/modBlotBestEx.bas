@@ -64,7 +64,8 @@ Public Const LV_ERROR As String = "ERROR"
 '------------------------------------ STATE ----------------------------------------------
 Public gHeadless As Boolean
 Private gT0 As Date, gSince As Date, gDeadline As Date, gNextRun As Date, gSchedPending As Boolean
-Private gKnown As String, gCandKey As String, gCandRows As Long, gBusy As Boolean, gKind As String
+Private gKnown As String, gStable As Object, gTries As Object, gPendingCand As Boolean, gBusy As Boolean, gKind As String
+Private gNoAccess As Long
 Private gPollAt As Date, gPollPending As Boolean, gCycleAt As Date, gCyclePending As Boolean
 Private gTestN As Long, gTestI As Long, gTestOK As Long, gLastErr As String, gWarned As String
 Private gScheduled As Boolean, gRetried As Boolean, gRetryAt As Date, gRetryPending As Boolean, gLastOK As Boolean
@@ -547,7 +548,7 @@ End Function
 ' Runs OPEN_SEQ + export variant gAltI and arms the poll. Each variant but the last gets ALT_WAIT_S.
 Private Function StartAcquisition() As Boolean
     Dim seq As String, lbl As String
-    gT0 = Now: gCandKey = "": gCandRows = -1
+    gT0 = Now: Set gStable = NewDict(): Set gTries = NewDict()
     gKnown = SnapshotWorkbooks()
     gWinBefore = WindowTitles()
     gSince = gT0
@@ -571,12 +572,11 @@ Public Sub NextExportVariant()
     If Not StartAcquisition() Then OnAcquireTimeout
 End Sub
 
-' "variant1 || variant2": alternative export sequences, tried in order until one exports
+
+' '||' is an ordinary separator (one sequence); kept as a function so the run logic stays unchanged
 Public Function SplitAlts(ByVal s As String) As Collection
-    Dim c As New Collection, a As Variant
-    For Each a In Split(s, "||")
-        If Len(Trim$(CStr(a))) > 0 Then c.Add Trim$(CStr(a))
-    Next
+    Dim c As New Collection
+    If Len(Trim$(s)) > 0 Then c.Add Replace(s, "||", "|")
     Set SplitAlts = c
 End Function
 
@@ -609,7 +609,7 @@ Private Sub OnAcquireTimeout()
     If Not gAlts Is Nothing Then
         If gAltI < gAlts.Count Then                           ' try the next export variant
             WriteLog "Export variant " & gAltI & "/" & gAlts.Count & " gave no export file" & IIf(Len(gLastErr) > 0, " (" & gLastErr & ")", "") & _
-                     ". Windows: " & WindowReport(), LV_WARN
+                     ". Windows: " & WindowReport() & " | " & ExportReport(), LV_WARN
             fr = FocusTarget(gAlts(gAltI))                     ' close a dialog left open by this variant
             If Len(fr) > 0 Then
                 If FocusWindowLike(fr) Then SendKeys "{ESC}", True
@@ -622,6 +622,7 @@ Private Sub OnAcquireTimeout()
     msg = "TIMEOUT: BLOT export not detected after " & TIMEOUT_S & "s (new Excel workbook or new XLS file in a watched folder)."
     If Len(gLastErr) > 0 Then msg = msg & " Last error: " & gLastErr
     WriteLog "Windows at timeout: " & WindowReport(), LV_WARN
+    WriteLog "Export search at timeout: " & ExportReport(), LV_WARN
     If gKind = "TEST" Then
         TestCycleDone False, msg
     Else
@@ -668,17 +669,14 @@ End Sub
 ' The export is either a new workbook (any Excel instance) or a new XLS file in a watched folder
 Private Function TryAcquire() As Boolean
     Dim fo As Variant, f As String
+    gPendingCand = False
     If TryNewWorkbooks() Then TryAcquire = True: Exit Function
+    If gPendingCand Then Exit Function                        ' an export workbook is still being filled
     For Each fo In WatchFolders()
         f = NewestFileSince(CStr(fo), gSince)
         If Len(f) > 0 Then
             If TryFile(f) Then
-                If StrComp(CStr(fo), EXPORT_FOLDER, vbTextCompare) <> 0 Then
-                    On Error Resume Next
-                    SetConfigValue "EXPORT_FOLDER", CStr(fo)
-                    On Error GoTo 0
-                    WriteLog "Export found in " & fo & ": saved as EXPORT_FOLDER.", LV_INFO
-                End If
+                WriteLog "Bloomberg wrote the export in " & fo & ".", LV_INFO
                 TryAcquire = True
                 Exit Function
             End If
@@ -686,12 +684,13 @@ Private Function TryAcquire() As Boolean
     Next
 End Function
 
-' EXPORT_FOLDER first, then the usual places Bloomberg saves an export
+' Where Bloomberg may write the XLS: EXPORT_FOLDER, this workbook's folder and the usual Windows / Bloomberg folders
 Private Function WatchFolders() As Collection
     Dim c As New Collection, f As Variant, seen As Object, k As String
     Set seen = NewDict()
     For Each f In Array(EXPORT_FOLDER, ThisWorkbook.Path, Environ$("USERPROFILE") & "\Downloads", _
-                        Environ$("USERPROFILE") & "\Documents", "C:\blp\data", "C:\blp\Export")
+                        Environ$("USERPROFILE") & "\Documents", Environ$("USERPROFILE") & "\Desktop", _
+                        "C:\blp\data", "C:\blp\Export", Environ$("TEMP"))
         k = LCase$(CStr(f))
         If Len(k) > 0 And Not seen.Exists(k) Then
             seen(k) = 1
@@ -718,7 +717,7 @@ Private Function TryNewWorkbooks() As Boolean
                     Exit Function
                 ElseIf InStr(1, gWarned, k, vbTextCompare) = 0 Then
                     gWarned = gWarned & Mid$(k, 2)
-                    WriteLog "New workbook " & wb.Name & " ignored: no BLOT header row.", LV_INFO
+                    WriteLog "New workbook " & wb.Name & " ignored: no BLOT header row (" & FirstRowsText(wb) & ").", LV_WARN
                 End If
             End If
         Next
@@ -749,25 +748,42 @@ Private Function TryProtectedView(ByVal app As Object) As Boolean
 Done:
 End Function
 
+' A file that cannot be opened yet (still written, locked) is retried on the next polls (5 times)
 Private Function TryFile(ByVal f As String) As Boolean
-    Dim wb As Workbook, blk As Object
+    Dim wb As Object, blk As Object, opened As Boolean, da As Boolean
     If Len(f) = 0 Then Exit Function
     If InStr(1, gKnown, "|" & f & "|", vbTextCompare) > 0 Then Exit Function
     If Not IsStable("F|" & f, FileLen(f)) Then Exit Function
+    da = Application.DisplayAlerts
+    On Error GoTo OpenFail
+    Set blk = OpenExportFile(f, wb, opened)
+    On Error GoTo 0
     gKnown = gKnown & f & "|"
-    Set blk = OpenExportFile(f, wb)
     If blk Is Nothing Then
-        Notify "File " & f & " ignored: no BLOT header row.", LV_WARN
+        WriteLog "File " & f & " ignored: no BLOT header row (" & IIf(wb Is Nothing, "text file", FirstRowsText(wb)) & ").", LV_WARN
     Else
-        HandleExport blk("v"), blk("raw"), "file " & f, Nothing, f
+        HandleExport blk("v"), blk("raw"), "file " & f, wb, f
         TryFile = True
     End If
-    If Not wb Is Nothing Then wb.Close False
+    If opened Then wb.Close False
+    Exit Function
+OpenFail:
+    Application.DisplayAlerts = da
+    gLastErr = "cannot open " & f & ": " & Err.Description
+    If gTries Is Nothing Then Set gTries = NewDict()
+    gTries(f) = gTries(f) + 1
+    If gTries(f) >= 5 Then
+        gKnown = gKnown & f & "|"
+        WriteLog "File " & f & " could not be opened after 5 tries: " & Err.Description, LV_WARN
+    Else
+        gPendingCand = True
+    End If
 End Function
 
-' Opens an export file (CSV as text, Excel / Bloomberg XLS through Excel) and finds the BLOT block
-Private Function OpenExportFile(ByVal f As String, ByRef wb As Workbook) As Object
+' CSV/TXT as text; Excel / Bloomberg XLS through Excel. A file Excel already has open is used as it is.
+Private Function OpenExportFile(ByVal f As String, ByRef wb As Object, ByRef opened As Boolean) As Object
     Dim da As Boolean, a As Variant, blk As Variant, d As Object
+    opened = False
     If LCase$(Right$(f, 4)) = ".csv" Or LCase$(Right$(f, 4)) = ".txt" Then
         a = ParseCsvText(ReadTextFile(f), "AUTO")
         blk = FindBlockInArray(a)
@@ -776,11 +792,79 @@ Private Function OpenExportFile(ByVal f As String, ByRef wb As Workbook) As Obje
         d("v") = blk: d("raw") = blk: d("rows") = UBound(blk, 1): d("label") = Dir$(f)
         Set OpenExportFile = d
     Else
-        da = Application.DisplayAlerts: Application.DisplayAlerts = False   ' Bloomberg XLS: "format and extension" prompt
-        Set wb = Workbooks.Open(f, UpdateLinks:=0, ReadOnly:=True)
-        Application.DisplayAlerts = da
+        Set wb = OpenWorkbookNamed(f)
+        If wb Is Nothing Then
+            da = Application.DisplayAlerts: Application.DisplayAlerts = False   ' Bloomberg XLS: "format and extension" prompt
+            Set wb = Workbooks.Open(f, UpdateLinks:=0, ReadOnly:=True)
+            Application.DisplayAlerts = da
+            opened = True
+        End If
         Set OpenExportFile = FindBlockInWorkbook(wb)
     End If
+End Function
+
+' The workbook if it is already open in any Excel instance (same path, or same name in this instance)
+Private Function OpenWorkbookNamed(ByVal f As String) As Object
+    Dim app As Object, wb As Object, nm As String
+    nm = Mid$(f, InStrRev(f, "\") + 1)
+    On Error Resume Next
+    For Each app In AllExcelApps()
+        For Each wb In app.Workbooks
+            If StrComp(wb.FullName, f, vbTextCompare) = 0 Then Set OpenWorkbookNamed = wb: Exit Function
+            If app Is Application And StrComp(wb.Name, nm, vbTextCompare) = 0 Then Set OpenWorkbookNamed = wb: Exit Function
+        Next
+    Next
+End Function
+
+' "sheet 'X': a | b | c" for the first non-empty row of every sheet (diagnostics)
+Private Function FirstRowsText(ByVal wb As Object) As String
+    Dim ws As Object, a As Variant, r As Long, c As Long, s As String, t As String
+    On Error Resume Next
+    For Each ws In wb.Worksheets
+        a = ws.UsedRange.Value2
+        t = ""
+        If IsArray(a) Then
+            For r = 1 To Application.WorksheetFunction.Min(UBound(a, 1), 5)
+                For c = 1 To Application.WorksheetFunction.Min(UBound(a, 2), 20)
+                    If Len(CellS(a, r, c)) > 0 Then t = t & CellS(a, r, c) & " | "
+                Next
+                If Len(t) > 0 Then Exit For
+            Next
+        ElseIf Not IsEmpty(a) Then
+            t = CStr(a)
+        End If
+        s = s & "sheet '" & ws.Name & "': " & IIf(Len(t) > 0, Left$(t, 250), "(empty)") & "; "
+    Next
+    FirstRowsText = s
+End Function
+
+' Timeout diagnostics: every workbook open in every Excel instance + new files in the watched folders
+Private Function ExportReport() As String
+    Dim app As Object, wb As Object, s As String, fo As Variant, f As String, pat As Variant, n As Long
+    On Error Resume Next
+    For Each app In AllExcelApps()
+        For Each wb In app.Workbooks
+            If Not wb Is ThisWorkbook Then s = s & "[" & wb.Name & "] " & FirstRowsText(wb) & " "
+        Next
+        For Each wb In app.ProtectedViewWindows
+            s = s & "[protected view: " & wb.Caption & "] "
+        Next
+    Next
+    If Len(s) = 0 Then s = "no other workbook open"
+    s = "Workbooks: " & s
+    If gNoAccess > 0 Then s = s & " | " & gNoAccess & " Excel window(s) could not be read (other user / admin rights?)"
+    s = s & " | New files since the run started: "
+    For Each fo In WatchFolders()
+        For Each pat In Array("*.xls*", "*.csv", "*.txt", "*.htm*", "*.xml")
+            f = Dir$(fo & "\" & pat)
+            Do While Len(f) > 0 And n < 15
+                If FileDateTime(fo & "\" & f) >= gSince Then s = s & fo & "\" & f & " (" & FileLen(fo & "\" & f) & " bytes); ": n = n + 1
+                f = Dir$()
+            Loop
+        Next
+    Next
+    If n = 0 Then s = s & "none"
+    ExportReport = s
 End Function
 
 ' Newest *.xls* / *.csv modified since 'since' (this workbook, Excel temp files and archive copies excluded)
@@ -813,6 +897,7 @@ Private Function AllExcelApps() As Collection
     Dim col As New Collection, seen As Object, hMain As LongPtr, hDesk As LongPtr, h7 As LongPtr
     Dim w As Object, iid As GUID_T, app As Object
     Set seen = NewDict()
+    gNoAccess = 0
     col.Add Application: seen(CStr(Application.Hwnd)) = 1
     IIDFromString StrPtr("{00020400-0000-0000-C000-000000000046}"), iid
     hMain = FindWindowEx(0, 0, "XLMAIN", vbNullString)
@@ -826,6 +911,8 @@ Private Function AllExcelApps() As Collection
             If AccessibleObjectFromWindow(h7, OBJID_NATIVEOM, iid, w) = 0 Then Set app = w.Application
             If Not app Is Nothing Then
                 If Not seen.Exists(CStr(app.Hwnd)) Then seen(CStr(app.Hwnd)) = 1: col.Add app
+            Else
+                gNoAccess = gNoAccess + 1
             End If
             On Error GoTo 0
         End If
@@ -846,8 +933,15 @@ Private Function SnapshotWorkbooks() As String
     SnapshotWorkbooks = s
 End Function
 
+' A candidate is processed once its size is unchanged over two polls. Each candidate has its own
+' tracker (a workbook Bloomberg opens AND the file it saves must not reset each other).
 Private Function IsStable(ByVal key As String, ByVal n As Long) As Boolean
-    If key = gCandKey And n = gCandRows Then IsStable = True Else gCandKey = key: gCandRows = n
+    If gStable Is Nothing Then Set gStable = NewDict()
+    If gStable.Exists(key) Then
+        If gStable(key) = n Then IsStable = True: Exit Function
+    End If
+    gStable(key) = n
+    gPendingCand = True
 End Function
 
 '==========================================================================================
@@ -1159,7 +1253,7 @@ End Function
 ' Header row = first of 40 rows with a dealer column and an ID or ISIN column
 Private Function FindHeaderRow(a As Variant, ByRef lastC As Long) As Long
     Dim r As Long, c As Long, lc As Long, rMax As Long, hdr() As Variant
-    rMax = UBound(a, 1): If rMax > 40 Then rMax = 40
+    rMax = UBound(a, 1): If rMax > 100 Then rMax = 100
     For r = 1 To rMax
         lc = 0
         For c = UBound(a, 2) To 1 Step -1
@@ -1863,7 +1957,8 @@ Private Function ProcessData(v As Variant, vRaw As Variant, ByVal srcLabel As St
     WriteLog "Statuses seen: " & res("statuses"), LV_INFO
 
     m = res("m"): ts = Now
-    If m > 0 Then arch = ArchiveExport(srcWb, srcFile, vRaw, res("maxTD")) Else arch = ArchiveExport(srcWb, srcFile, vRaw, PrevBusinessDay(Date))
+    If m > 0 Then arch = SaveExport(srcWb, srcFile, vRaw, res("maxTD")) Else arch = SaveExport(srcWb, srcFile, vRaw, PrevBusinessDay(Date))
+    If Len(arch) > 0 Then WriteLog "Export saved: " & arch, LV_INFO
     If m = 0 Then
         WriteSheetTable GetSheet(SH_QUOTES), QuoteHeader(), Empty, 0
         Notify "ALERT: the export has no dealer rows (" & srcLabel & "). Confirm that the desk did not trade.", LV_ALERT
@@ -1910,19 +2005,27 @@ Private Function DateRangeText(ByVal d0 As Date, ByVal d1 As Date) As String
     If d0 = d1 Then DateRangeText = Format$(d0, "yyyy-mm-dd") Else DateRangeText = Format$(d0, "yyyy-mm-dd") & ".." & Format$(d1, "yyyy-mm-dd")
 End Function
 
-Private Function ArchiveExport(ByVal srcWb As Object, ByVal srcFile As String, vRaw As Variant, ByVal td As Date) As String
-    Dim base As String, ext As String, p As String, wb As Workbook
-    If Len(ARCHIVE_DIR) = 0 Then
-        Notify "ALERT: ARCHIVE_DIR is empty on CONFIG - the export was NOT archived.", LV_ALERT
-        Exit Function
-    End If
-    EnsureFolder ARCHIVE_DIR
-    base = ARCHIVE_DIR & "\BLOT_" & Format$(td, "yyyymmdd") & "_" & Format$(Now, "yyyymmdd_hhnnss")
-    On Error GoTo Fallback
+' Saves the export in EXPORT_FOLDER as BLOT_<tradedate>_<yyyymmdd_hhnnss>.<ext> (the dated copy is the
+' regulatory evidence). File exports are copied (also while Excel has them open); open workbooks are
+' saved with SaveCopyAs; if both fail the grid itself is written to a new .xlsx.
+Private Function SaveExport(ByVal srcWb As Object, ByVal srcFile As String, vRaw As Variant, ByVal td As Date) As String
+    Dim base As String, ext As String, p As String, wb As Workbook, fso As Object, dest As String
+    dest = EXPORT_FOLDER
+    If Len(dest) = 0 Then dest = ThisWorkbook.Path & "\BLOT_EXPORTS"
+    EnsureFolder dest
+    base = dest & "\BLOT_" & Format$(td, "yyyymmdd") & "_" & Format$(Now, "yyyymmdd_hhnnss")
+    On Error GoTo TryWorkbook
     If Len(srcFile) > 0 Then
         p = base & LCase$(Mid$(srcFile, InStrRev(srcFile, ".")))
-        FileCopy srcFile, p
-    ElseIf Not srcWb Is Nothing Then
+        Set fso = CreateObject("Scripting.FileSystemObject")
+        fso.CopyFile srcFile, p, True
+        SaveExport = p
+        Exit Function
+    End If
+TryWorkbook:
+    On Error GoTo -1
+    On Error GoTo Fallback
+    If Not srcWb Is Nothing Then
         Select Case srcWb.FileFormat
             Case 52: ext = ".xlsm"
             Case 56: ext = ".xls"
@@ -1932,11 +2035,9 @@ Private Function ArchiveExport(ByVal srcWb As Object, ByVal srcFile As String, v
         End Select
         p = base & ext
         srcWb.SaveCopyAs p
-    Else
-        GoTo Fallback
+        SaveExport = p
+        Exit Function
     End If
-    ArchiveExport = p
-    Exit Function
 Fallback:
     On Error GoTo -1
     On Error GoTo Failed
@@ -1947,11 +2048,11 @@ Fallback:
     wb.SaveAs p, 51
     Application.DisplayAlerts = True
     wb.Close False
-    ArchiveExport = p
+    SaveExport = p
     Exit Function
 Failed:
     Application.DisplayAlerts = True
-    Notify "ALERT: could not archive the export to " & ARCHIVE_DIR & " (" & Err.Description & ").", LV_ALERT
+    Notify "ALERT: could not save the export in " & dest & " (" & Err.Description & ").", LV_ALERT
     On Error GoTo -1
     On Error Resume Next
     If Not wb Is Nothing Then wb.Close False

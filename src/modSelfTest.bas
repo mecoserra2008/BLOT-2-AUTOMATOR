@@ -351,8 +351,9 @@ Private Sub UnitTests()
 
     '--- steps ---
     Check "unit", "steps", "default EXPORT_SEQ valid", "", ValidateSteps(DefaultOf("EXPORT_SEQ"))
-    Check "unit", "steps", "default EXPORT_SEQ has 2 variants", "2", CStr(SplitAlts(DefaultOf("EXPORT_SEQ")).Count)
-    Check "unit", "steps", "variant 1 presses 1+GO in the dialog", "True", B2S(InStr(1, SplitAlts(DefaultOf("EXPORT_SEQ"))(1), "FOCUS:Export Blotter|SEND:1~") > 0)
+    Check "unit", "steps", "default EXPORT_SEQ = the DDE sequence that exported", "KEYS:2<GO>|WAIT:2|KEYS:2<GO>|WAIT:3|KEYS:1<GO>|WAIT:5", DefaultOf("EXPORT_SEQ")
+    Check "unit", "steps", "operator form with || = ONE sequence", "1", CStr(SplitAlts("KEYS:2<GO>|WAIT:2|KEYS:2<GO>|WAIT:3 || KEYS:1<GO>").Count)
+    Check "unit", "steps", "operator form keeps KEYS:1<GO>", "True", B2S(InStr(1, SplitAlts("KEYS:2<GO>|WAIT:2|KEYS:2<GO>|WAIT:3 || KEYS:1<GO>")(1), "KEYS:1<GO>") > 0)
     Check "unit", "steps", "FOCUS / IFWIN accepted", "", ValidateSteps("FOCUS:Export Blotter|SEND:1~|IFWIN:Replace:~|WAIT:1")
     Check "unit", "steps", "IFWIN without keys rejected", "True", B2S(Len(ValidateSteps("IFWIN:Replace")) > 0)
     Check "unit", "steps", "Bloomberg exe", "True", B2S(IsBloombergExe("wintrv.exe"))
