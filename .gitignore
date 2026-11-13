@@ -8,3 +8,4 @@ modBlotBestEx (1).bas
 # site-specific configuration (paths) and the configured workbook built from it
 config/*.local.ini
 dist/*_SITE.xlsm
+__pycache__/
