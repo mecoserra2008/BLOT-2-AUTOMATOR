@@ -54,6 +54,14 @@ foreach ($f in $modules + 'ThisWorkbook.vba') {
     $bad = 0; foreach ($b in $bytes) { if ($b -gt 127) { $bad++ } }
     if ($bad -gt 0) { throw "$f contains $bad non-ASCII byte(s): the VBA import would corrupt them." }
     $text = [Text.Encoding]::ASCII.GetString($bytes) -replace "`r`n", "`n" -replace "`r", "`n" -replace "`n", "`r`n"
+    # VBA syntax traps that make Excel stop on a hidden compile-error dialog (the build would hang)
+    $ln = 0; $cont = 0
+    foreach ($l in ($text -split "`r`n")) {
+        $ln++
+        $code = ($l -replace '"[^"]*"', '""') -replace "'.*$", ''
+        if ($code -match '\bThen\b\s+\S.*\bElseIf\b') { throw "$f line ${ln}: single-line If ... ElseIf is not valid VBA." }
+        if ($code -match '\s_\s*$') { $cont++; if ($cont -gt 24) { throw "$f line ${ln}: more than 24 line continuations in one statement." } } else { $cont = 0 }
+    }
     [IO.File]::WriteAllText((Join-Path $tmp $f), $text, [Text.Encoding]::ASCII)
 }
 

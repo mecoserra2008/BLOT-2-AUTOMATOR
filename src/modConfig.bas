@@ -267,13 +267,49 @@ Public Sub WriteConfigSheet()
     ws.Columns(7).ColumnWidth = 70: ws.Columns(8).ColumnWidth = 2
     ws.Columns(9).ColumnWidth = 12: ws.Columns(10).ColumnWidth = 36
     WriteHolidayTable ws, hol, nHol
-    AddSheetButtons ws, Array("Validate Config|ValidateConfig", "Test Export|TestExport", "Install Daily Task|InstallDailyTask", "Remove Daily Task|RemoveDailyTask")
+    AddSheetButtons ws, Array("Validate Config|ValidateConfig", "Test Export|TestExport", "Install Daily Task|InstallDailyTask", _
+                              "Remove Daily Task|RemoveDailyTask", "Silence Format Prompt|SilenceFormatPrompt")
 End Sub
 
 Public Sub Hdr(rg As Range)
     rg.Font.Bold = True
     rg.Interior.Color = RGB(31, 56, 100)
     rg.Font.Color = vbWhite
+End Sub
+
+' Excel's "The file format and extension of ... don't match" warning (Microsoft setting ExtensionHardening:
+' 0 = no warning, 1 = warn (default), 2 = block). Only needed when Bloomberg itself opens the export in Excel.
+Private Function ExtHardeningKey() As String
+    ExtHardeningKey = "HKCU\Software\Microsoft\Office\" & Application.Version & "\Excel\Security\ExtensionHardening"
+End Function
+
+Public Function ExtensionHardening() As Long
+    On Error GoTo NotSet
+    ExtensionHardening = CLng(CreateObject("WScript.Shell").RegRead(ExtHardeningKey()))
+    Exit Function
+NotSet:
+    ExtensionHardening = 1
+End Function
+
+Public Sub SilenceFormatPrompt()
+    If MsgBox("Switch off Excel's warning 'The file format and extension of ... don't match' for your Windows user?" & vbLf & vbLf & _
+              "Microsoft setting ExtensionHardening = 0. Files still open normally; Protected View and macro security are not changed." & vbLf & _
+              "Needed only when Bloomberg itself opens the export in Excel (the workbook reads the export as data without any prompt)." & vbLf & vbLf & _
+              "Close and reopen Excel afterwards.", vbYesNo + vbQuestion, "Silence Format Prompt") <> vbYes Then Exit Sub
+    On Error GoTo EH
+    CreateObject("WScript.Shell").RegWrite ExtHardeningKey(), 0, "REG_DWORD"
+    WriteLog "Excel format/extension warning switched off for this user (" & ExtHardeningKey() & " = 0).", "INFO"
+    MsgBox "Done. Close and reopen Excel for it to take effect. (To undo: run RestoreFormatPrompt.)", vbInformation, "Silence Format Prompt"
+    Exit Sub
+EH:
+    MsgBox "Could not change the setting (blocked by policy?): " & Err.Description, vbExclamation, "Silence Format Prompt"
+End Sub
+
+Public Sub RestoreFormatPrompt()
+    On Error Resume Next
+    CreateObject("WScript.Shell").RegDelete ExtHardeningKey()
+    WriteLog "Excel format/extension warning restored (default).", "INFO"
+    If Application.Visible Then MsgBox "Excel's default warning is restored. Close and reopen Excel.", vbInformation
 End Sub
 
 Public Sub SetConfigValue(ByVal key As String, ByVal v As String)
@@ -460,6 +496,11 @@ Public Function ValidateConfigCore(Optional ByRef nFail As Long, Optional ByRef 
             VAdd res, "SCHEDULE_MODE", "FAIL", "'" & SCHEDULE_MODE & "' is not TASK | WORKBOOK | OFF."
     End Select
     If ThisWorkbook.ReadOnly Then VAdd res, "Workbook", "FAIL", "Opened read-only: history cannot be saved." Else VAdd res, "Workbook", "PASS", ThisWorkbook.FullName
+    If ExtensionHardening() = 0 Then
+        VAdd res, "Format prompt", "PASS", "Excel's 'format and extension don't match' warning is off for this user."
+    Else
+        VAdd res, "Format prompt", "WARN", "The workbook reads the export as data (no prompt). If BLOOMBERG opens the file in Excel after exporting, the prompt still appears: click Silence Format Prompt."
+    End If
     If POLL_S < 1 Or TIMEOUT_S <= POLL_S Then VAdd res, "TIMEOUT_S / POLL_S", "FAIL", "Need POLL_S >= 1 and TIMEOUT_S > POLL_S." Else VAdd res, "TIMEOUT_S / POLL_S", "PASS", TIMEOUT_S & "s / " & POLL_S & "s"
     If Len(ALERT_TO) = 0 Then VAdd res, "ALERT_TO", "WARN", "No e-mail alerts." Else VAdd res, "ALERT_TO", "PASS", ALERT_TO
     If SHOW_POPUPS Then VAdd res, "SHOW_POPUPS", "WARN", "TRUE blocks unattended runs until dismissed." Else VAdd res, "SHOW_POPUPS", "PASS", "FALSE"

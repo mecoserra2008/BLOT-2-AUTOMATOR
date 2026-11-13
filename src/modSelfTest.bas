@@ -363,6 +363,33 @@ Private Sub UnitTests()
     Check "unit", "steps", "clicks no longer supported", "True", B2S(Len(ValidateSteps("CLICK:10,20")) > 0)
     Check "unit", "steps", "bad wait rejected", "True", B2S(Len(ValidateSteps("WAIT:x")) > 0)
 
+    '--- reading exports without opening them in Excel ---
+    a = ParseHtmlRows("<html><table><tr><th>A</th><th>B &amp; C</th></tr><tr><td>1</td><td colspan=""2"">x</td><td>&nbsp;y<br>z</td></tr></table></html>")
+    Check "unit", "html", "rows x cols", "2x4", UBound(a, 1) & "x" & UBound(a, 2)
+    Check "unit", "html", "entity decoded", "B & C", CStr(a(1, 2))
+    Check "unit", "html", "colspan leaves an empty cell", "|x||y z|", "|" & a(2, 2) & "|" & a(2, 3) & "|" & a(2, 4) & "|"
+    a = ParseXmlSS("<?xml version=""1.0""?><Workbook xmlns=""urn:schemas-microsoft-com:office:spreadsheet"" xmlns:ss=""urn:schemas-microsoft-com:office:spreadsheet""><Worksheet ss:Name=""S""><Table>" & _
+                   "<Row><Cell><Data ss:Type=""String"">BrkrName</Data></Cell><Cell ss:Index=""3""><Data ss:Type=""Number"">96.198</Data></Cell></Row>" & _
+                   "<Row><Cell/><Cell><Data ss:Type=""String"">BNP</Data></Cell></Row></Table></Worksheet></Workbook>")
+    Check "unit", "xml", "rows x cols", "2x3", UBound(a, 1) & "x" & UBound(a, 2)
+    Check "unit", "xml", "ss:Index gap", "|BrkrName||96.198|", "|" & a(1, 1) & "|" & a(1, 2) & "|" & a(1, 3) & "|"
+    Check "unit", "xml", "empty cell keeps position", "BNP", CStr(a(2, 2))
+    Check "unit", "kind", "html file", "html", KindOfText("<html><body><table><tr><td>x</td></tr></table>")
+    Check "unit", "kind", "excel-xml file", "xmlss", KindOfText("<?xml version=""1.0""?><?mso-application progid=""Excel.Sheet""?><Workbook xmlns=""urn:schemas-microsoft-com:office:spreadsheet"">")
+    Check "unit", "kind", "tab text file", "text", KindOfText("Security" & vbTab & "Side" & vbTab & "BrkrName")
+    Check "unit", "kind", "extension for html", ".htm", KindExt("html")
+
+    '--- only real BLOT exports are picked up ---
+    Check "unit", "pickup", "QUOTES sheet header is not an export", "True", B2S(IsEmpty(FindBlockInArray(HdrRow(QuoteHeader()))))
+    a = HdrRow(Array("Security", "Side", "Block", "Status", "Qty (M)", "Price", "Yield", "BrkrName", "Net", "Curncy", "Account", "Trade Dt", "SetDt", "ISIN", "Ac/c", "Factor", "ID"))
+    Check "unit", "pickup", "real BLOT header is an export", "False", B2S(IsEmpty(FindBlockInArray(a)))
+    Check "unit", "pickup", "Blotter.xls is a candidate", "True", B2S(IsExportFileName("Blotter.xls"))
+    Check "unit", "pickup", "export.htm is a candidate", "True", B2S(IsExportFileName("export.htm"))
+    Check "unit", "pickup", ".xlsm never", "False", B2S(IsExportFileName("anything.xlsm"))
+    Check "unit", "pickup", "BLOT_BestEx copies never", "False", B2S(IsExportFileName("BLOT_BestEx_SITE.xlsx"))
+    Check "unit", "pickup", "dated copies never", "False", B2S(IsExportFileName("BLOT_20261112_20261113_082901.xls"))
+    Check "unit", "pickup", "Excel lock files never", "False", B2S(IsExportFileName("~$Blotter.xls"))
+
     '--- scheduling ---
     Check "unit", "schedule", "default SCHEDULE_MODE", "WORKBOOK", SCHEDULE_MODE
     s = TaskScriptText("M:\BLOT\BLOT_BestEx.xlsm")
@@ -379,6 +406,15 @@ Private Sub UnitTests()
     Check "unit", "headers", "isin", "14", CStr(HeaderIndex(a, HDR_ISIN))
     Check "unit", "headers", "empty alias never matches empty header", "0", CStr(HeaderIndex(HdrRow(Array("", "x", "y")), "|dealer"))
 End Sub
+
+' FileKind of a temporary file holding the text
+Private Function KindOfText(ByVal txt As String) As String
+    Dim p As String, h As Integer
+    p = Environ$("TEMP") & "\blot_kind_test.xls"
+    h = FreeFile: Open p For Output As #h: Print #h, txt: Close #h
+    KindOfText = FileKind(p)
+    Kill p
+End Function
 
 Private Function B2S(ByVal b As Boolean) As String
     If b Then B2S = "True" Else B2S = "False"

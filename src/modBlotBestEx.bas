@@ -705,7 +705,7 @@ Private Function TryNewWorkbooks() As Boolean
     For Each app In AllExcelApps()
         For Each wb In app.Workbooks
             k = "|" & app.Hwnd & ":" & wb.FullName & "|"
-            If InStr(1, gKnown, k, vbTextCompare) = 0 Then
+            If InStr(1, gKnown, k, vbTextCompare) = 0 And IsExportCandidate(wb) Then
                 Set blk = FindBlockInWorkbook(wb)
                 If Not blk Is Nothing Then
                     If IsStable(k, blk("rows")) Then
@@ -780,27 +780,282 @@ OpenFail:
     End If
 End Function
 
-' CSV/TXT as text; Excel / Bloomberg XLS through Excel. A file Excel already has open is used as it is.
+' Reads an export WITHOUT the "file format and extension don't match" prompt:
+'   - the real format is taken from the file content (FileKind), not from the extension
+'   - HTML table, Excel-XML (SpreadsheetML) and text/CSV are parsed as data: Excel never opens them
+'   - a real .xls / .xlsx is opened from a temporary copy whose extension matches its content
+' A workbook Excel already has open is used as it is.
 Private Function OpenExportFile(ByVal f As String, ByRef wb As Object, ByRef opened As Boolean) As Object
-    Dim da As Boolean, a As Variant, blk As Variant, d As Object
+    Dim da As Boolean, a As Variant, blk As Variant, d As Object, kind As String, tmp As String, fso As Object
     opened = False
-    If LCase$(Right$(f, 4)) = ".csv" Or LCase$(Right$(f, 4)) = ".txt" Then
-        a = ParseCsvText(ReadTextFile(f), "AUTO")
+    kind = FileKind(f)
+    If kind = "html" Or kind = "xmlss" Or kind = "text" Then
+        Select Case kind
+            Case "html":  a = ParseHtmlRows(ReadTextFile(f))
+            Case "xmlss": a = ParseXmlSS(ReadTextFile(f))
+            Case Else:    a = ParseCsvText(ReadTextFile(f), "AUTO")
+        End Select
         blk = FindBlockInArray(a)
-        If IsEmpty(blk) Then Exit Function
-        Set d = NewDict()
-        d("v") = blk: d("raw") = blk: d("rows") = UBound(blk, 1): d("label") = Dir$(f)
-        Set OpenExportFile = d
-    Else
-        Set wb = OpenWorkbookNamed(f)
-        If wb Is Nothing Then
-            da = Application.DisplayAlerts: Application.DisplayAlerts = False   ' Bloomberg XLS: "format and extension" prompt
-            Set wb = Workbooks.Open(f, UpdateLinks:=0, ReadOnly:=True)
-            Application.DisplayAlerts = da
-            opened = True
+        If Not IsEmpty(blk) Then
+            Set d = NewDict()
+            d("v") = blk: d("raw") = blk: d("rows") = UBound(blk, 1): d("label") = Dir$(f) & " (" & kind & ", read as data)"
+            Set OpenExportFile = d
+            Exit Function
         End If
-        Set OpenExportFile = FindBlockInWorkbook(wb)
+        If kind <> "html" Then Exit Function                  ' only HTML gets a second chance through Excel
     End If
+    Set wb = OpenWorkbookNamed(f)
+    If wb Is Nothing Then
+        tmp = f
+        If LCase$(Mid$(f, InStrRev(f, "."))) <> KindExt(kind) Then
+            tmp = Environ$("TEMP") & "\blot_export_" & Format$(Now, "yyyymmdd_hhnnss") & KindExt(kind)
+            Set fso = CreateObject("Scripting.FileSystemObject")
+            fso.CopyFile f, tmp, True
+        End If
+        da = Application.DisplayAlerts: Application.DisplayAlerts = False
+        Set wb = Workbooks.Open(tmp, UpdateLinks:=0, ReadOnly:=True, AddToMru:=False)
+        Application.DisplayAlerts = da
+        opened = True
+    End If
+    Set OpenExportFile = FindBlockInWorkbook(wb)
+End Function
+
+' Real format of a file from its first bytes: xls (OLE2 / BIFF), xlsx (zip), xmlss, html or text
+Public Function FileKind(ByVal f As String) As String
+    Dim st As Object, b() As Byte, n As Long, t As String
+    On Error GoTo AsText
+    Set st = CreateObject("ADODB.Stream")
+    st.Type = 1: st.Open: st.LoadFromFile f
+    n = st.Size
+    If n >= 4 Then
+        b = st.Read(8)
+        st.Close
+        If b(0) = &HD0 And b(1) = &HCF And b(2) = &H11 And b(3) = &HE0 Then FileKind = "xls": Exit Function
+        If b(0) = &H50 And b(1) = &H4B And b(2) = &H3 And b(3) = &H4 Then FileKind = "xlsx": Exit Function
+    Else
+        st.Close
+    End If
+AsText:
+    On Error GoTo 0
+    t = LCase$(Left$(ReadTextFile(f), 8000))
+    If InStr(1, t, "urn:schemas-microsoft-com:office:spreadsheet") > 0 Or InStr(1, t, "<workbook") > 0 Or InStr(1, t, "<ss:workbook") > 0 Then
+        FileKind = "xmlss"
+    ElseIf InStr(1, t, "<table") > 0 Or InStr(1, t, "<html") > 0 Then
+        FileKind = "html"
+    Else
+        FileKind = "text"
+    End If
+End Function
+
+Public Function KindExt(ByVal kind As String) As String
+    Select Case kind
+        Case "xls":   KindExt = ".xls"
+        Case "xlsx":  KindExt = ".xlsx"
+        Case "html":  KindExt = ".htm"
+        Case "xmlss": KindExt = ".xml"
+        Case Else:    KindExt = ".txt"
+    End Select
+End Function
+
+' Rows of every <tr> of an HTML document (cells of <td> / <th>, colspan honoured), 1-based 2-D array of text
+Public Function ParseHtmlRows(ByVal h As String) As Variant
+    Dim lc As String, p As Long, q As Long, nx As Long, seg As String, segL As String
+    Dim rows As New Collection, cells() As String, nc As Long, maxC As Long, c0 As Long, c1 As Long, cEnd As Long
+    Dim tagEnd As Long, span As Long, k As Long, a() As Variant, r As Long, j As Long, rw As Variant, txt As String
+    lc = LCase$(h)
+    p = NextTagPos(lc, 1, "tr")
+    Do While p > 0
+        q = InStr(p + 3, lc, "</tr")
+        nx = NextTagPos(lc, p + 3, "tr")
+        If q = 0 Or (nx > 0 And nx < q) Then
+            If nx > 0 Then q = nx Else q = Len(lc) + 1
+        End If
+        seg = Mid$(h, p, q - p): segL = Mid$(lc, p, q - p)
+        nc = 0: ReDim cells(0 To 31)
+        c0 = NextCellPos(segL, 1)
+        Do While c0 > 0
+            tagEnd = InStr(c0, segL, ">")
+            If tagEnd = 0 Then Exit Do
+            c1 = NextCellPos(segL, tagEnd + 1)
+            cEnd = InStr(tagEnd + 1, segL, "</t")
+            If cEnd = 0 Or (c1 > 0 And c1 < cEnd) Then
+                If c1 > 0 Then cEnd = c1 Else cEnd = Len(segL) + 1
+            End If
+            txt = HtmlText(Mid$(seg, tagEnd + 1, cEnd - tagEnd - 1))
+            span = AttrNum(Mid$(segL, c0, tagEnd - c0), "colspan")
+            If span < 1 Then span = 1
+            For k = 1 To span
+                If nc > UBound(cells) Then ReDim Preserve cells(0 To 2 * UBound(cells) + 1)
+                If k = 1 Then cells(nc) = txt Else cells(nc) = ""
+                nc = nc + 1
+            Next
+            c0 = c1
+        Loop
+        If nc > 0 Then
+            ReDim Preserve cells(0 To nc - 1)
+            rows.Add cells
+            If nc > maxC Then maxC = nc
+        End If
+        p = NextTagPos(lc, q, "tr")
+    Loop
+    If rows.Count = 0 Then Exit Function
+    ReDim a(1 To rows.Count, 1 To maxC)
+    For Each rw In rows
+        r = r + 1
+        For j = 1 To maxC
+            If j - 1 <= UBound(rw) Then a(r, j) = rw(j - 1) Else a(r, j) = ""
+        Next
+    Next
+    ParseHtmlRows = a
+End Function
+
+' Excel-XML 2003 (SpreadsheetML): <Row><Cell ss:Index="n"><Data>value</Data></Cell></Row>
+Public Function ParseXmlSS(ByVal x As String) As Variant
+    Dim lc As String, p As Long, q As Long, seg As String, segL As String, c0 As Long, c1 As Long, cEnd As Long
+    Dim rows As New Collection, cells() As String, col As Long, maxC As Long, ix As Long, d0 As Long, d1 As Long
+    Dim tagEnd As Long, a() As Variant, r As Long, j As Long, rw As Variant, txt As String
+    lc = LCase$(x)
+    p = NextTagPos(lc, 1, "row")
+    Do While p > 0
+        q = InStr(p, lc, "</row>"): If q = 0 Then q = InStr(p, lc, "</ss:row>")
+        If q = 0 Then q = Len(lc) + 1
+        seg = Mid$(x, p, q - p): segL = Mid$(lc, p, q - p)
+        col = 0: ReDim cells(0 To 31)
+        c0 = NextTagPos(segL, 1, "cell")
+        Do While c0 > 0
+            tagEnd = InStr(c0, segL, ">")
+            If tagEnd = 0 Then Exit Do
+            ix = AttrNum(Mid$(segL, c0, tagEnd - c0), "index")
+            If ix > 0 Then col = ix Else col = col + 1
+            c1 = NextTagPos(segL, tagEnd + 1, "cell")
+            If c1 > 0 Then cEnd = c1 Else cEnd = Len(segL) + 1
+            txt = ""
+            d0 = NextTagPos(segL, tagEnd + 1, "data")
+            If d0 > 0 And d0 < cEnd Then
+                d0 = InStr(d0, segL, ">") + 1
+                d1 = InStr(d0, segL, "</")
+                If d1 > d0 And d1 <= cEnd Then txt = HtmlText(Mid$(seg, d0, d1 - d0))
+            End If
+            If col - 1 > UBound(cells) Then ReDim Preserve cells(0 To 2 * col + 1)
+            cells(col - 1) = txt
+            If col > maxC Then maxC = col
+            c0 = c1
+        Loop
+        If col > 0 Then
+            ReDim Preserve cells(0 To col - 1)
+            rows.Add cells
+        End If
+        p = NextTagPos(lc, q, "row")
+    Loop
+    If rows.Count = 0 Then Exit Function
+    ReDim a(1 To rows.Count, 1 To maxC)
+    For Each rw In rows
+        r = r + 1
+        For j = 1 To maxC
+            If j - 1 <= UBound(rw) Then a(r, j) = rw(j - 1) Else a(r, j) = ""
+        Next
+    Next
+    ParseXmlSS = a
+End Function
+
+' Position of the next <name ...> or <ss:name ...> tag (lowercase text), 0 if none
+Private Function NextTagPos(ByVal lc As String, ByVal start As Long, ByVal name As String) As Long
+    Dim p As Long, c As String, best As Long, pre As Variant
+    For Each pre In Array("<", "<ss:")
+        p = InStr(start, lc, pre & name)
+        Do While p > 0
+            c = Mid$(lc, p + Len(pre) + Len(name), 1)
+            If c = " " Or c = ">" Or c = "/" Or c = vbTab Or c = vbCr Or c = vbLf Then Exit Do
+            p = InStr(p + 1, lc, pre & name)
+        Loop
+        If p > 0 And (best = 0 Or p < best) Then best = p
+    Next
+    NextTagPos = best
+End Function
+
+Private Function NextCellPos(ByVal lc As String, ByVal start As Long) As Long
+    Dim a As Long, b As Long
+    a = NextTagPos(lc, start, "td"): b = NextTagPos(lc, start, "th")
+    If a = 0 Then
+        NextCellPos = b
+    ElseIf b = 0 Then
+        NextCellPos = a
+    ElseIf a < b Then
+        NextCellPos = a
+    Else
+        NextCellPos = b
+    End If
+End Function
+
+' Numeric attribute value (colspan="2", ss:Index="3"), 0 if absent
+Private Function AttrNum(ByVal tagL As String, ByVal attr As String) As Long
+    Dim p As Long, s As String, i As Long, ch As String
+    p = InStr(1, tagL, attr & "=")
+    If p = 0 Then Exit Function
+    p = p + Len(attr) + 1
+    For i = p To Len(tagL)
+        ch = Mid$(tagL, i, 1)
+        If ch Like "#" Then
+            s = s & ch
+        ElseIf Len(s) > 0 Then
+            Exit For
+        ElseIf ch <> """" And ch <> "'" And ch <> " " Then
+            Exit For
+        End If
+    Next
+    If Len(s) > 0 Then AttrNum = CLng(s)
+End Function
+
+' Inner HTML/XML to plain text: tags removed, line breaks -> space, entities decoded
+Public Function HtmlText(ByVal s As String) As String
+    Dim o As String, i As Long, ch As String, inTag As Boolean, p As Long, ent As String, code As Long
+    s = Replace(Replace(Replace(s, vbCr, " "), vbLf, " "), vbTab, " ")
+    For i = 1 To Len(s)
+        ch = Mid$(s, i, 1)
+        If inTag Then
+            If ch = ">" Then inTag = False: o = o & " "
+        ElseIf ch = "<" Then
+            inTag = True
+        Else
+            o = o & ch
+        End If
+    Next
+    s = o: o = ""
+    i = 1
+    Do While i <= Len(s)
+        ch = Mid$(s, i, 1)
+        If ch = "&" Then
+            p = InStr(i, s, ";")
+            If p > i And p - i <= 10 Then
+                ent = LCase$(Mid$(s, i + 1, p - i - 1))
+                Select Case ent
+                    Case "amp": o = o & "&"
+                    Case "lt": o = o & "<"
+                    Case "gt": o = o & ">"
+                    Case "quot": o = o & """"
+                    Case "apos": o = o & "'"
+                    Case "nbsp": o = o & " "
+                    Case Else
+                        code = 0
+                        On Error Resume Next
+                        If Left$(ent, 2) = "#x" Then
+                            code = CLng("&H" & Mid$(ent, 3))
+                        ElseIf Left$(ent, 1) = "#" Then
+                            code = CLng(Mid$(ent, 2))
+                        End If
+                        On Error GoTo 0
+                        If code > 0 Then o = o & ChrW(code) Else o = o & "&" & ent & ";"
+                End Select
+                i = p + 1
+            Else
+                o = o & ch: i = i + 1
+            End If
+        Else
+            o = o & ch: i = i + 1
+        End If
+    Loop
+    Do While InStr(1, o, "  ") > 0: o = Replace(o, "  ", " "): Loop
+    HtmlText = Trim$(Replace(o, Chr$(160), " "))
 End Function
 
 ' The workbook if it is already open in any Excel instance (same path, or same name in this instance)
@@ -855,34 +1110,58 @@ Private Function ExportReport() As String
     If gNoAccess > 0 Then s = s & " | " & gNoAccess & " Excel window(s) could not be read (other user / admin rights?)"
     s = s & " | New files since the run started: "
     For Each fo In WatchFolders()
-        For Each pat In Array("*.xls*", "*.csv", "*.txt", "*.htm*", "*.xml")
-            f = Dir$(fo & "\" & pat)
-            Do While Len(f) > 0 And n < 15
+        f = Dir$(fo & "\*.*")
+        Do While Len(f) > 0 And n < 15
+            If IsExportFileName(f) Then
                 If FileDateTime(fo & "\" & f) >= gSince Then s = s & fo & "\" & f & " (" & FileLen(fo & "\" & f) & " bytes); ": n = n + 1
-                f = Dir$()
-            Loop
-        Next
+            End If
+            f = Dir$()
+        Loop
     Next
     If n = 0 Then s = s & "none"
     ExportReport = s
 End Function
 
-' Newest *.xls* / *.csv modified since 'since' (this workbook, Excel temp files and archive copies excluded)
+' Newest export-like file modified since 'since'
 Private Function NewestFileSince(ByVal folder As String, ByVal since As Date) As String
-    Dim f As String, best As String, bt As Date, ft As Date, pat As Variant
+    Dim f As String, best As String, bt As Date, ft As Date
     If Right$(folder, 1) <> "\" Then folder = folder & "\"
-    For Each pat In Array("*.xls*", "*.csv")
-        f = Dir$(folder & pat)
-        Do While Len(f) > 0
-            If Left$(f, 2) <> "~$" And StrComp(folder & f, ThisWorkbook.FullName, vbTextCompare) <> 0 _
-               And Not (f Like "BLOT_########_########_######*") Then
-                ft = FileDateTime(folder & f)
-                If ft >= since And ft > bt Then bt = ft: best = folder & f
-            End If
-            f = Dir$()
-        Loop
-    Next
+    f = Dir$(folder & "*.*")
+    Do While Len(f) > 0
+        If IsExportFileName(f) And StrComp(folder & f, ThisWorkbook.FullName, vbTextCompare) <> 0 Then
+            ft = FileDateTime(folder & f)
+            If ft >= since And ft > bt Then bt = ft: best = folder & f
+        End If
+        f = Dir$()
+    Loop
     NewestFileSince = best
+End Function
+
+' Bloomberg writes data files: .xls .xlsx .csv .txt .htm .html .xml. Never a macro workbook (.xlsm/.xlsb),
+' an Excel lock file, this workbook (or a copy of it) or one of our dated export copies.
+Public Function IsExportFileName(ByVal f As String) As Boolean
+    Dim ext As String
+    If InStrRev(f, ".") = 0 Then Exit Function
+    ext = LCase$(Mid$(f, InStrRev(f, ".")))
+    If InStr(1, "|.xls|.xlsx|.csv|.txt|.htm|.html|.xml|", "|" & ext & "|") = 0 Then Exit Function
+    If Left$(f, 2) = "~$" Then Exit Function
+    If LCase$(Left$(f, 11)) = "blot_bestex" Then Exit Function
+    If f Like "BLOT_########_########_######*" Then Exit Function
+    IsExportFileName = True
+End Function
+
+' An open workbook can be the export only if it holds no macros and is not a BLOT workbook
+Private Function IsExportCandidate(ByVal wb As Object) As Boolean
+    Dim ws As Object
+    On Error GoTo No
+    If wb Is ThisWorkbook Then Exit Function
+    If wb.HasVBProject Then Exit Function
+    If wb.FileFormat = 52 Or wb.FileFormat = 50 Then Exit Function
+    For Each ws In wb.Worksheets
+        If ws.Name = SH_CONFIG Or ws.Name = SH_QUOTES Or ws.Name = SH_INQ Then Exit Function
+    Next
+    IsExportCandidate = True
+No:
 End Function
 
 Private Sub CloseExport(ByVal wb As Object, ByVal app As Object)
@@ -1250,7 +1529,8 @@ Public Function FindBlockInArray(a As Variant) As Variant
     If r > 0 Then FindBlockInArray = SliceBlock(a, r, lc)
 End Function
 
-' Header row = first of 40 rows with a dealer column and an ID or ISIN column
+' Header row = first of 100 rows with the dealer, ID and status columns of a BLOT export
+' (this workbook's own QUOTES / INQUIRIES / HIST sheets have no ID column, so they never match)
 Private Function FindHeaderRow(a As Variant, ByRef lastC As Long) As Long
     Dim r As Long, c As Long, lc As Long, rMax As Long, hdr() As Variant
     rMax = UBound(a, 1): If rMax > 100 Then rMax = 100
@@ -1262,7 +1542,7 @@ Private Function FindHeaderRow(a As Variant, ByRef lastC As Long) As Long
         If lc >= 3 Then
             ReDim hdr(1 To 1, 1 To lc)
             For c = 1 To lc: hdr(1, c) = a(r, c): Next
-            If HeaderIndex(hdr, HDR_DEALER) > 0 And (HeaderIndex(hdr, HDR_ID) > 0 Or HeaderIndex(hdr, HDR_ISIN) > 0) Then
+            If HeaderIndex(hdr, HDR_DEALER) > 0 And HeaderIndex(hdr, HDR_ID) > 0 And HeaderIndex(hdr, HDR_STATUS) > 0 Then
                 FindHeaderRow = r: lastC = lc: Exit Function
             End If
         End If
@@ -1595,6 +1875,7 @@ NextRow:
 
     If nNoDl > 0 Then warn = warn & nNoDl & " row(s) without dealer ignored. "
     If nFb > 0 Then warn = warn & nFb & " row(s) without a readable trade date: " & Format$(defTD, "yyyy-mm-dd") & " used (check DATE_FORMAT_TEXT). "
+    If maxTD > Date Then warn = warn & "Trade date " & Format$(maxTD, "yyyy-mm-dd") & " is in the future: day and month swapped? Check DATE_FORMAT_TEXT (" & DATE_FORMAT_TEXT & "). "
     If nSusp > 0 Then warn = warn & nSusp & " bond/side/day group(s) have one request per dealer row: check ID_SUFFIX_LEN. "
     If nKey > 0 Then warn = warn & nKey & " request(s) mix ISINs, sides or dates under one ID (KEY?). "
     res("ok") = True
@@ -2016,7 +2297,7 @@ Private Function SaveExport(ByVal srcWb As Object, ByVal srcFile As String, vRaw
     base = dest & "\BLOT_" & Format$(td, "yyyymmdd") & "_" & Format$(Now, "yyyymmdd_hhnnss")
     On Error GoTo TryWorkbook
     If Len(srcFile) > 0 Then
-        p = base & LCase$(Mid$(srcFile, InStrRev(srcFile, ".")))
+        p = base & KindExt(FileKind(srcFile))                ' true extension: opening it later never warns
         Set fso = CreateObject("Scripting.FileSystemObject")
         fso.CopyFile srcFile, p, True
         SaveExport = p
