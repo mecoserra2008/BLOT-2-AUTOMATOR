@@ -18,6 +18,12 @@ Option Explicit
 '==========================================================================================
 
 '------------------------------------ WIN32 ----------------------------------------------
+Private Type RECT_T
+    Left As Long
+    Top As Long
+    Right As Long
+    Bottom As Long
+End Type
 Private Type GUID_T
     Data1 As Long
     Data2 As Integer
@@ -32,6 +38,18 @@ Private Declare PtrSafe Function ShowWindow Lib "user32" (ByVal hwnd As LongPtr,
 Private Declare PtrSafe Function SetForegroundWindow Lib "user32" (ByVal hwnd As LongPtr) As Long
 Private Declare PtrSafe Function AccessibleObjectFromWindow Lib "oleacc" (ByVal hwnd As LongPtr, ByVal dwId As Long, riid As GUID_T, ppvObject As Object) As Long
 Private Declare PtrSafe Function IIDFromString Lib "ole32" (ByVal lpsz As LongPtr, lpiid As GUID_T) As Long
+Private Declare PtrSafe Function GetForegroundWindow Lib "user32" () As LongPtr
+Private Declare PtrSafe Function GetWindowThreadProcessId Lib "user32" (ByVal hwnd As LongPtr, lpdwProcessId As Long) As Long
+Private Declare PtrSafe Function GetCurrentThreadId Lib "kernel32" () As Long
+Private Declare PtrSafe Function AttachThreadInput Lib "user32" (ByVal idAttach As Long, ByVal idAttachTo As Long, ByVal fAttach As Long) As Long
+Private Declare PtrSafe Function BringWindowToTop Lib "user32" (ByVal hwnd As LongPtr) As Long
+Private Declare PtrSafe Function GetWindowRect Lib "user32" (ByVal hwnd As LongPtr, lpRect As RECT_T) As Long
+Private Declare PtrSafe Function OpenProcess Lib "kernel32" (ByVal dwDesiredAccess As Long, ByVal bInheritHandle As Long, ByVal dwProcessId As Long) As LongPtr
+Private Declare PtrSafe Function QueryFullProcessImageName Lib "kernel32" Alias "QueryFullProcessImageNameA" (ByVal hProcess As LongPtr, ByVal dwFlags As Long, ByVal lpExeName As String, lpdwSize As Long) As Long
+Private Declare PtrSafe Function CloseHandle Lib "kernel32" (ByVal hObject As LongPtr) As Long
+Private Const PROCESS_QUERY_LIMITED_INFORMATION As Long = &H1000
+Private Const BBG_EXES As String = "wintrv*.exe|bplus*.exe|blp*.exe|bloomberg*.exe|bbg*.exe|bterm*.exe"
+Private Const ALT_WAIT_S As Long = 30     ' seconds an export variant gets before the next one is tried
 Private Const OBJID_NATIVEOM As Long = &HFFFFFFF0
 Private Const SW_RESTORE As Long = 9
 
@@ -50,6 +68,7 @@ Private gKnown As String, gCandKey As String, gCandRows As Long, gBusy As Boolea
 Private gPollAt As Date, gPollPending As Boolean, gCycleAt As Date, gCyclePending As Boolean
 Private gTestN As Long, gTestI As Long, gTestOK As Long, gLastErr As String, gWarned As String
 Private gScheduled As Boolean, gRetried As Boolean, gRetryAt As Date, gRetryPending As Boolean, gLastOK As Boolean
+Private gAlts As Collection, gAltI As Long, gCycleProc As String, gExeCache As Object, gWinBefore As String
 
 '==========================================================================================
 '                                    ENTRY POINTS
@@ -65,11 +84,7 @@ Private Sub StartRun()
     If Not BeginRun("RUN") Then Exit Sub
     gLastOK = False
     Notify "Run started" & IIf(gScheduled, " (scheduled)", "") & ": expected trade date " & Format$(PrevBusinessDay(Date), "yyyy-mm-dd") & ".", LV_INFO
-    If Not StartAcquisition() Then
-        FinishRun
-        SetStatus "FAILED: could not drive Bloomberg (see LOG).", True
-        MaybeRetry
-    End If
+    If Not StartAcquisition() Then OnAcquireTimeout
     Exit Sub
 EH:
     FinishRun
@@ -187,7 +202,8 @@ Public Sub StartTestCycle()
     On Error GoTo EH
     gTestI = gTestI + 1
     Application.StatusBar = "BLOT Test Export: cycle " & gTestI & "/" & gTestN
-    If Not StartAcquisition() Then TestCycleDone False, "steps failed (see LOG)"
+    Set gAlts = SplitAlts(EXPORT_SEQ): gAltI = 1
+    If Not StartAcquisition() Then OnAcquireTimeout
     Exit Sub
 EH:
     TestCycleDone False, "error: " & Err.Description
@@ -501,6 +517,7 @@ Private Function BeginRun(ByVal kind As String) As Boolean
     End If
     gBusy = True: gKind = kind: gLastErr = "": gWarned = "|"
     gDeadline = Now + TimeSerial(0, 0, TIMEOUT_S)
+    Set gAlts = SplitAlts(EXPORT_SEQ): gAltI = 1
     BeginRun = True
 End Function
 
@@ -513,7 +530,7 @@ End Sub
 Private Sub CancelPending()
     On Error Resume Next
     If gPollPending Then Application.OnTime gPollAt, ProcName("PollExport"), , False
-    If gCyclePending Then Application.OnTime gCycleAt, ProcName("StartTestCycle"), , False
+    If gCyclePending Then Application.OnTime gCycleAt, ProcName(gCycleProc), , False
     gPollPending = False: gCyclePending = False
 End Sub
 
@@ -527,26 +544,84 @@ Private Function ProcName(ByVal p As String) As String
     ProcName = "'" & ThisWorkbook.Name & "'!" & p
 End Function
 
+' Runs OPEN_SEQ + export variant gAltI and arms the poll. Each variant but the last gets ALT_WAIT_S.
 Private Function StartAcquisition() As Boolean
-    gT0 = Now: gDeadline = gT0 + TimeSerial(0, 0, TIMEOUT_S)
-    gCandKey = "": gCandRows = -1: gLastErr = ""
+    Dim seq As String, lbl As String
+    gT0 = Now: gCandKey = "": gCandRows = -1
     gKnown = SnapshotWorkbooks()
+    gWinBefore = WindowTitles()
     gSince = gT0
-    If Len(EXPORT_SEQ) = 0 Then Notify "EXPORT_SEQ is empty on CONFIG.", LV_ERROR: Exit Function
+    If gAlts Is Nothing Then Set gAlts = SplitAlts(EXPORT_SEQ): gAltI = 1
+    If gAlts.Count = 0 Then gLastErr = "EXPORT_SEQ is empty on CONFIG.": Exit Function
+    seq = gAlts(gAltI)
+    If gAlts.Count > 1 Then lbl = " (variant " & gAltI & "/" & gAlts.Count & ")"
+    If gAltI < gAlts.Count Then gDeadline = gT0 + TimeSerial(0, 0, ALT_WAIT_S) Else gDeadline = gT0 + TimeSerial(0, 0, TIMEOUT_S)
     SetStatus "1/3 Opening BLOT in Bloomberg...", False
-    If Not RunSteps(ExpandSeq(OPEN_SEQ, Date)) Then Notify "OPEN_SEQ failed: could not drive the Bloomberg Terminal.", LV_ERROR: Exit Function
-    SetStatus "2/3 Exporting the BLOT grid (XLS)...", False
-    If Not RunSteps(ExpandSeq(EXPORT_SEQ, Date)) Then Notify "EXPORT_SEQ failed.", LV_ERROR: Exit Function
-    SetStatus "3/3 Waiting for the export file...", False
+    If Not RunSteps(ExpandSeq(OPEN_SEQ, Date)) Then gLastErr = "OPEN_SEQ failed: could not drive the Bloomberg Terminal (DDE).": Exit Function
+    SetStatus "2/3 Exporting the BLOT grid" & lbl & "...", False
+    If Not RunSteps(ExpandSeq(seq, Date)) Then gLastErr = "export steps failed" & lbl & ": " & seq: Exit Function
+    SetStatus "3/3 Waiting for the export file" & lbl & "...", False
     SchedulePoll
     StartAcquisition = True
 End Function
 
+Public Sub NextExportVariant()
+    gCyclePending = False
+    If Not gBusy Then Exit Sub
+    If Not StartAcquisition() Then OnAcquireTimeout
+End Sub
+
+' "variant1 || variant2": alternative export sequences, tried in order until one exports
+Public Function SplitAlts(ByVal s As String) As Collection
+    Dim c As New Collection, a As Variant
+    For Each a In Split(s, "||")
+        If Len(Trim$(CStr(a))) > 0 Then c.Add Trim$(CStr(a))
+    Next
+    Set SplitAlts = c
+End Function
+
+Private Sub ArmCycle(ByVal proc As String, ByVal secs As Long)
+    gCycleProc = proc
+    gCycleAt = Now + TimeSerial(0, 0, secs)
+    Application.OnTime gCycleAt, ProcName(proc)
+    gCyclePending = True
+End Sub
+
+' The winning variant becomes the first one on CONFIG (used first next time)
+Private Sub PromoteVariant()
+    Dim i As Long, s As String
+    If gAlts Is Nothing Then Exit Sub
+    If gAltI <= 1 Or gAlts.Count < 2 Then Exit Sub
+    s = gAlts(gAltI)
+    For i = 1 To gAlts.Count
+        If i <> gAltI Then s = s & " || " & gAlts(i)
+    Next
+    On Error Resume Next
+    SetConfigValue "EXPORT_SEQ", s
+    EXPORT_SEQ = s
+    On Error GoTo 0
+    WriteLog "Export variant " & gAltI & " worked: moved first on CONFIG (EXPORT_SEQ = " & s & ").", LV_INFO
+End Sub
+
 Private Sub OnAcquireTimeout()
-    Dim msg As String
-    msg = "TIMEOUT: BLOT export not detected after " & TIMEOUT_S & "s (new Excel workbook" & _
-          IIf(Len(EXPORT_FOLDER) > 0, " or new file in " & EXPORT_FOLDER, "") & ")."
+    Dim msg As String, fr As String
+    CancelPending
+    If Not gAlts Is Nothing Then
+        If gAltI < gAlts.Count Then                           ' try the next export variant
+            WriteLog "Export variant " & gAltI & "/" & gAlts.Count & " gave no export file" & IIf(Len(gLastErr) > 0, " (" & gLastErr & ")", "") & _
+                     ". Windows: " & WindowReport(), LV_WARN
+            fr = FocusTarget(gAlts(gAltI))                     ' close a dialog left open by this variant
+            If Len(fr) > 0 Then
+                If FocusWindowLike(fr) Then SendKeys "{ESC}", True
+            End If
+            gAltI = gAltI + 1: gLastErr = ""
+            ArmCycle "NextExportVariant", 2
+            Exit Sub
+        End If
+    End If
+    msg = "TIMEOUT: BLOT export not detected after " & TIMEOUT_S & "s (new Excel workbook or new XLS file in a watched folder)."
     If Len(gLastErr) > 0 Then msg = msg & " Last error: " & gLastErr
+    WriteLog "Windows at timeout: " & WindowReport(), LV_WARN
     If gKind = "TEST" Then
         TestCycleDone False, msg
     Else
@@ -558,6 +633,7 @@ Private Sub OnAcquireTimeout()
 End Sub
 
 Private Sub HandleExport(v As Variant, vRaw As Variant, ByVal label As String, ByVal srcWb As Object, ByVal srcFile As String)
+    PromoteVariant
     If gKind = "TEST" Then
         TestCycleDone True, label, v
     Else
@@ -579,9 +655,7 @@ Private Sub TestCycleDone(ByVal ok As Boolean, ByVal detail As String, Optional 
     End If
     Notify "TestExport cycle " & gTestI & "/" & gTestN & ": " & IIf(ok, "OK - ", "FAIL - ") & detail, IIf(ok, LV_INFO, LV_WARN), False, True
     If gTestI < gTestN Then
-        gCycleAt = Now + TimeSerial(0, 0, 3)
-        Application.OnTime gCycleAt, ProcName("StartTestCycle")
-        gCyclePending = True
+        ArmCycle "StartTestCycle", 3
     Else
         FinishRun
         Notify "TestExport finished: " & gTestOK & "/" & gTestN & " cycle(s) succeeded.", IIf(gTestOK = gTestN, LV_INFO, LV_WARN), True, True
@@ -648,7 +722,31 @@ Private Function TryNewWorkbooks() As Boolean
                 End If
             End If
         Next
+        If TryProtectedView(app) Then TryNewWorkbooks = True: Exit Function
     Next
+End Function
+
+' An export opened by Excel in Protected View is not in Workbooks: read it through ProtectedViewWindows
+Private Function TryProtectedView(ByVal app As Object) As Boolean
+    Dim pv As Object, wb As Object, blk As Object, k As String
+    On Error GoTo Done
+    For Each pv In app.ProtectedViewWindows
+        Set wb = pv.Workbook
+        k = "|PV:" & app.Hwnd & ":" & wb.FullName & "|"
+        If InStr(1, gKnown, k, vbTextCompare) = 0 Then
+            Set blk = FindBlockInWorkbook(wb)
+            If Not blk Is Nothing Then
+                If IsStable(k, blk("rows")) Then
+                    gKnown = gKnown & Mid$(k, 2)
+                    HandleExport blk("v"), blk("raw"), "protected-view workbook " & blk("label"), wb, ""
+                    pv.Close
+                    TryProtectedView = True
+                End If
+                Exit Function
+            End If
+        End If
+    Next
+Done:
 End Function
 
 Private Function TryFile(ByVal f As String) As Boolean
@@ -765,9 +863,14 @@ Public Function ValidateSteps(ByVal seq As String) As String
         s = Trim$(CStr(st))
         If Len(s) > 0 Then
             p = InStr(1, s, ":")
-            If p = 0 Then ValidateSteps = "Bad step '" & s & "' (expected KEYS:..., SEND:... or WAIT:s).": Exit Function
+            If p = 0 Then ValidateSteps = "Bad step '" & s & "' (expected KEYS:, FOCUS:, SEND:, IFWIN: or WAIT:).": Exit Function
             tok = UCase$(Left$(s, p - 1)): arg = Mid$(s, p + 1)
             Select Case tok
+                Case "FOCUS"
+                    If Len(Trim$(arg)) = 0 Then ValidateSteps = "FOCUS needs a window title (part), e.g. FOCUS:Export Blotter.": Exit Function
+                Case "IFWIN"
+                    p = InStr(1, arg, ":")
+                    If p < 2 Or p = Len(arg) Then ValidateSteps = "Bad " & s & " (expected IFWIN:<window title part>:<keys>).": Exit Function
                 Case "KEYS", "SEND"
                     If Len(arg) = 0 Then ValidateSteps = "Empty " & tok & " step.": Exit Function
                     If tok = "KEYS" And (UCase$(Trim$(arg)) Like "[A-Z]<GO>" Or InStr(1, arg, "<N>", vbTextCompare) > 0) Then
@@ -776,14 +879,19 @@ Public Function ValidateSteps(ByVal seq As String) As String
                 Case "WAIT"
                     If Not IsPlainNumber(arg) Then ValidateSteps = "Bad " & s & " (seconds, '.' decimal).": Exit Function
                 Case Else
-                    ValidateSteps = "Unknown step '" & tok & "' (v5 supports KEYS, SEND, WAIT).": Exit Function
+                    ValidateSteps = "Unknown step '" & tok & "' (supported: KEYS, FOCUS, SEND, IFWIN, WAIT).": Exit Function
             End Select
         End If
     Next
 End Function
 
+' KEYS:text   typed in the Bloomberg command line through DDE (<GO> = GO key)
+' FOCUS:part  bring the window whose title contains 'part' to the front (else the Bloomberg panel)
+' SEND:keys   SendKeys to the window in front (after FOCUS), else to the Bloomberg panel (~ = Enter/GO)
+' IFWIN:part:keys  only if a window titled '...part...' is open: focus it and send keys (optional prompts)
+' WAIT:s      pause
 Private Function RunSteps(ByVal seq As String) As Boolean
-    Dim st As Variant, s As String, tok As String, arg As String, p As Long, e As String
+    Dim st As Variant, s As String, tok As String, arg As String, p As Long, e As String, focused As Boolean, h As LongPtr
     e = ValidateSteps(seq)
     If Len(e) > 0 Then Notify "Step sequence rejected: " & e, LV_ERROR: Exit Function
     For Each st In Split(seq, "|")
@@ -794,9 +902,32 @@ Private Function RunSteps(ByVal seq As String) As Boolean
             Select Case tok
                 Case "KEYS"
                     If Not BbgType(arg) Then Notify "Step failed: " & s & " (no DDE link and no Bloomberg window).", LV_ERROR: Exit Function
+                Case "FOCUS"
+                    If FocusWindowLike(arg) Then
+                        focused = True
+                        WriteLog "Step " & s & ": window '" & WindowTitle(GetForegroundWindow()) & "' in front.", LV_INFO
+                    ElseIf BbgFocus() Then
+                        focused = True
+                        WriteLog "Step " & s & ": no window titled '" & arg & "'; keys go to the Bloomberg panel '" & WindowTitle(BbgHwnd()) & "'.", LV_INFO
+                    Else
+                        gLastErr = "window '" & arg & "' / Bloomberg panel not found or could not be brought to the front (keys NOT sent)": Exit Function
+                    End If
                 Case "SEND"
-                    If Not BbgFocus() Then Notify "Step failed: " & s & " (window '" & BBG_TITLE_PREFIX & "' not found).", LV_ERROR: Exit Function
+                    If Not focused Then
+                        If Not BbgFocus() Then gLastErr = "Bloomberg window not found for " & s: Exit Function
+                    End If
                     SendKeys arg, True
+                Case "IFWIN"
+                    p = InStr(1, arg, ":")
+                    h = FindWindowLike(Left$(arg, p - 1))
+                    If h <> 0 Then
+                        If ForceForeground(h) Then
+                            SendKeys Mid$(arg, p + 1), True
+                            WriteLog "Step " & s & ": window '" & WindowTitle(h) & "' answered.", LV_INFO
+                        Else
+                            WriteLog "Step " & s & ": window '" & WindowTitle(h) & "' could not be brought to the front; keys NOT sent.", LV_WARN
+                        End If
+                    End If
                 Case "WAIT"
                     WaitSec Val(arg)
             End Select
@@ -827,28 +958,160 @@ Fail:
     BbgType = False
 End Function
 
-Private Function BbgHwnd() As LongPtr
-    Dim h As LongPtr, s As String, l As Long
-    If Len(BBG_TITLE_PREFIX) = 0 Then Exit Function
+' Bloomberg panel: title starts with BBG_TITLE_PREFIX, else the largest window of a Bloomberg process
+Public Function BbgHwnd() As LongPtr
+    Dim h As LongPtr, t As String, rc As RECT_T, area As Double, best As LongPtr, bestA As Double
     h = FindWindowEx(0, 0, vbNullString, vbNullString)
     Do While h <> 0
         If IsWindowVisible(h) <> 0 Then
-            s = String$(260, vbNullChar): l = GetWindowText(h, s, 260)
-            If l > 0 Then
-                If UCase$(Left$(Left$(s, l), Len(BBG_TITLE_PREFIX))) = UCase$(BBG_TITLE_PREFIX) Then BbgHwnd = h: Exit Function
+            t = WindowTitle(h)
+            If Len(t) > 0 Then
+                If Len(BBG_TITLE_PREFIX) > 0 Then
+                    If UCase$(Left$(t, Len(BBG_TITLE_PREFIX))) = UCase$(BBG_TITLE_PREFIX) Then BbgHwnd = h: Exit Function
+                End If
+                If IsBloombergExe(ProcessExe(WindowPid(h))) Then
+                    GetWindowRect h, rc
+                    area = CDbl(rc.Right - rc.Left) * CDbl(rc.Bottom - rc.Top)
+                    If area > bestA Then bestA = area: best = h
+                End If
             End If
         End If
         h = FindWindowEx(0, h, vbNullString, vbNullString)
     Loop
+    BbgHwnd = best
 End Function
 
 Private Function BbgFocus() As Boolean
     Dim h As LongPtr
     h = BbgHwnd(): If h = 0 Then Exit Function
+    BbgFocus = ForceForeground(h)
+End Function
+
+' Visible top-level window whose title contains 'part' (Bloomberg windows preferred)
+Private Function FindWindowLike(ByVal part As String) As LongPtr
+    Dim h As LongPtr, t As String, other As LongPtr
+    part = Trim$(part)
+    If Len(part) = 0 Then Exit Function
+    h = FindWindowEx(0, 0, vbNullString, vbNullString)
+    Do While h <> 0
+        If IsWindowVisible(h) <> 0 Then
+            t = WindowTitle(h)
+            If InStr(1, t, part, vbTextCompare) > 0 And WindowPid(h) <> WindowPid(Application.Hwnd) Then
+                If IsBloombergExe(ProcessExe(WindowPid(h))) Then FindWindowLike = h: Exit Function
+                If other = 0 Then other = h
+            End If
+        End If
+        h = FindWindowEx(0, h, vbNullString, vbNullString)
+    Loop
+    FindWindowLike = other
+End Function
+
+Private Function FocusWindowLike(ByVal part As String) As Boolean
+    Dim h As LongPtr
+    h = FindWindowLike(part)
+    If h = 0 Then Exit Function
+    FocusWindowLike = ForceForeground(h)
+End Function
+
+' SetForegroundWindow is refused to background processes: attach to the foreground thread first
+' Returns True only when the window (or another window of its process) is really in front:
+' keys are never sent to whatever else the operator has open
+Private Function ForceForeground(ByVal h As LongPtr) As Boolean
+    Dim fg As LongPtr, tFg As Long, tMe As Long, dummy As Long
+    If h = 0 Then Exit Function
     If IsIconic(h) <> 0 Then ShowWindow h, SW_RESTORE
-    SetForegroundWindow h
+    fg = GetForegroundWindow()
+    If fg <> h Then
+        tFg = GetWindowThreadProcessId(fg, dummy)
+        tMe = GetCurrentThreadId()
+        If tFg <> tMe And tFg <> 0 Then AttachThreadInput tMe, tFg, 1
+        BringWindowToTop h
+        SetForegroundWindow h
+        If tFg <> tMe And tFg <> 0 Then AttachThreadInput tMe, tFg, 0
+    End If
     WaitSec 0.5
-    BbgFocus = True
+    ForceForeground = (WindowPid(GetForegroundWindow()) = WindowPid(h))
+End Function
+
+' The window title of the first FOCUS: step of a sequence ("" if none)
+Private Function FocusTarget(ByVal seq As String) As String
+    Dim st As Variant, s As String
+    For Each st In Split(seq, "|")
+        s = Trim$(CStr(st))
+        If UCase$(Left$(s, 6)) = "FOCUS:" Then FocusTarget = Mid$(s, 7): Exit Function
+    Next
+End Function
+
+Private Function WindowTitle(ByVal h As LongPtr) As String
+    Dim s As String, l As Long
+    If h = 0 Then Exit Function
+    s = String$(260, vbNullChar): l = GetWindowText(h, s, 260)
+    If l > 0 Then WindowTitle = Left$(s, l)
+End Function
+
+Private Function WindowPid(ByVal h As LongPtr) As Long
+    Dim pid As Long
+    If h <> 0 Then GetWindowThreadProcessId h, pid
+    WindowPid = pid
+End Function
+
+Private Function ProcessExe(ByVal pid As Long) As String
+    Dim hp As LongPtr, buf As String, n As Long
+    If pid = 0 Then Exit Function
+    If gExeCache Is Nothing Then Set gExeCache = NewDict()
+    If gExeCache.Exists(pid) Then ProcessExe = gExeCache(pid): Exit Function
+    hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
+    If hp <> 0 Then
+        buf = String$(1024, vbNullChar): n = 1024
+        If QueryFullProcessImageName(hp, 0, buf, n) <> 0 Then
+            buf = Left$(buf, n)
+            ProcessExe = LCase$(Mid$(buf, InStrRev(buf, "\") + 1))
+        End If
+        CloseHandle hp
+    End If
+    gExeCache(pid) = ProcessExe
+End Function
+
+Public Function IsBloombergExe(ByVal exe As String) As Boolean
+    Dim a As Variant
+    If Len(exe) = 0 Then Exit Function
+    For Each a In Split(BBG_EXES, "|")
+        If LCase$(exe) Like CStr(a) Then IsBloombergExe = True: Exit Function
+    Next
+End Function
+
+' "|title|title|" of the visible top-level windows (to see which appeared during a run)
+Private Function WindowTitles() As String
+    Dim h As LongPtr, t As String, s As String
+    s = "|"
+    h = FindWindowEx(0, 0, vbNullString, vbNullString)
+    Do While h <> 0
+        If IsWindowVisible(h) <> 0 Then
+            t = WindowTitle(h)
+            If Len(t) > 0 Then s = s & t & "|"
+        End If
+        h = FindWindowEx(0, h, vbNullString, vbNullString)
+    Loop
+    WindowTitles = s
+End Function
+
+' For the LOG when no export arrives: window in front, windows opened during the run, Bloomberg windows
+Public Function WindowReport() As String
+    Dim h As LongPtr, t As String, nw As String, bb As String, n As Long, m As Long
+    h = GetForegroundWindow()
+    WindowReport = "in front: '" & WindowTitle(h) & "' [" & ProcessExe(WindowPid(h)) & "]"
+    h = FindWindowEx(0, 0, vbNullString, vbNullString)
+    Do While h <> 0
+        If IsWindowVisible(h) <> 0 Then
+            t = WindowTitle(h)
+            If Len(t) > 0 Then
+                If InStr(1, gWinBefore, "|" & t & "|", vbBinaryCompare) = 0 And n < 10 Then nw = nw & "'" & t & "' [" & ProcessExe(WindowPid(h)) & "]; ": n = n + 1
+                If IsBloombergExe(ProcessExe(WindowPid(h))) And m < 10 Then bb = bb & "'" & t & "'; ": m = m + 1
+            End If
+        End If
+        h = FindWindowEx(0, h, vbNullString, vbNullString)
+    Loop
+    WindowReport = WindowReport & " | opened during the run: " & IIf(Len(nw) > 0, nw, "none") & " | Bloomberg windows: " & IIf(Len(bb) > 0, bb, "none")
 End Function
 
 Private Function EscKeys(ByVal s As String) As String

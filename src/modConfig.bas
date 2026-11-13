@@ -57,7 +57,8 @@ Private Sub BuildDefs()
     AddDef "BLOOMBERG", "BBG_PANEL", "<blp-1>", "Bloomberg panel used for the DDE keystrokes.", ""
     AddDef "BLOOMBERG", "BBG_TITLE_PREFIX", "1-BLOOMBERG", "Start of the panel window title (only needed for SEND: steps).", ""
     AddDef "BLOOMBERG", "OPEN_SEQ", "KEYS:BLOT 2<GO>|WAIT:3|KEYS:BLOT -1<GO>|WAIT:5", "Opens the BLOT of the previous day. KEYS:text<GO> | SEND:keys | WAIT:s. {DAYS_BACK} = days to the previous business day.", ""
-    AddDef "BLOOMBERG", "EXPORT_SEQ", "KEYS:2<GO>|WAIT:2|KEYS:2<GO>|WAIT:3|KEYS:1<GO>|WAIT:5", "Export: 2<GO> Export, 2<GO> 'XLS - Excel format', 1<GO> '1) Export' in the Export Blotter dialog.", ""
+    AddDef "BLOOMBERG", "EXPORT_SEQ", "KEYS:2<GO>|WAIT:2|KEYS:2<GO>|WAIT:3|FOCUS:Export Blotter|SEND:1~|WAIT:5 || KEYS:2<GO>|WAIT:2|KEYS:2<GO>|WAIT:3|FOCUS:Export Blotter|SEND:~|WAIT:5", _
+           "Export: 2<GO> Export, 2<GO> 'XLS - Excel format', then the Export Blotter dialog is brought to the front and '1) Export' pressed (1 + GO). Variants after || are tried if no file arrives; the one that works moves first.", ""
     AddDef "BLOOMBERG", "EXPORT_FOLDER", "", "Folder where Bloomberg saves the exported XLS (watched during the run). Empty = only exports that open in Excel.", "U"
     AddDef "BLOOMBERG", "TIMEOUT_S", "300", "Seconds to wait for the export before a TIMEOUT alert.", ""
     AddDef "BLOOMBERG", "POLL_S", "3", "Seconds between checks for the export.", ""
@@ -440,6 +441,7 @@ Public Function ValidateConfigCore(Optional ByRef nFail As Long, Optional ByRef 
     If Len(EXPORT_SEQ) = 0 Then e = "Empty."
     If Len(e) > 0 Then VAdd res, "EXPORT_SEQ", "FAIL", e Else VAdd res, "EXPORT_SEQ", "PASS", EXPORT_SEQ & " (confirm with Test Export 5/5)"
     If DdeAvailable(msg) Then VAdd res, "DDE link", "PASS", msg Else VAdd res, "DDE link", "FAIL", msg
+    If BbgHwnd() = 0 Then VAdd res, "Bloomberg window", "WARN", "Not found (needed to press keys in the Export Blotter dialog). Terminal open?" Else VAdd res, "Bloomberg window", "PASS", "Found."
 
     If Len(EXPORT_FOLDER) = 0 Then
         VAdd res, "EXPORT_FOLDER", "WARN", "Empty: only exports that open in Excel are detected."
