@@ -390,6 +390,10 @@ Private Sub UnitTests()
     Check "unit", "pickup", "dated copies never", "False", B2S(IsExportFileName("BLOT_20261112_20261113_082901.xls"))
     Check "unit", "pickup", "Excel lock files never", "False", B2S(IsExportFileName("~$Blotter.xls"))
 
+    '--- one-button run ---
+    Check "unit", "onego", "SILENCE_FORMAT_PROMPT default", "True", B2S(SILENCE_FORMAT_PROMPT)
+    Check "unit", "onego", "dashboard = RUN BLOT CHECK + Abort", "2", CStr(UBound(DashButtons()) + 1)
+
     '--- scheduling ---
     Check "unit", "schedule", "default SCHEDULE_MODE", "WORKBOOK", SCHEDULE_MODE
     s = TaskScriptText("M:\BLOT\BLOT_BestEx.xlsm")

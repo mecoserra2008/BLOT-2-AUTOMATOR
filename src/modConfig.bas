@@ -32,6 +32,7 @@ Private Const HOLIDAY_REF  As String = "I5:I400"
 Public BBG_PANEL As String, BBG_TITLE_PREFIX As String, OPEN_SEQ As String, EXPORT_SEQ As String
 Public EXPORT_FOLDER As String, TIMEOUT_S As Long, POLL_S As Long
 Public RUN_AT As String, ALERT_TO As String, SHOW_POPUPS As Boolean, SCHEDULE_MODE As String, RETRY_MIN As Long
+Public SILENCE_FORMAT_PROMPT As Boolean
 Public MIN_Q As Long, GROUP_LEVEL As String, FILL_STATUS As String, ID_SUFFIX_LEN As Long, DATE_FORMAT_TEXT As String
 Public HDR_DEALER As String, HDR_ID As String, HDR_SECURITY As String, HDR_ISIN As String, HDR_SIDE As String
 Public HDR_STATUS As String, HDR_QTY As String, HDR_PRICE As String, HDR_DATE As String
@@ -68,6 +69,7 @@ Private Sub BuildDefs()
     AddDef "RUN", "RETRY_MIN", "10", "Scheduled run only: minutes before ONE retry when Bloomberg did not export (0 = no retry).", ""
     AddDef "RUN", "ALERT_TO", "", "E-mail recipients (';'-separated) for alerts, timeouts and errors. Empty = no e-mail.", "U"
     AddDef "RUN", "SHOW_POPUPS", "FALSE", "TRUE = popup on alerts (blocks Excel until dismissed: keep FALSE for unattended runs).", ""
+    AddDef "RUN", "SILENCE_FORMAT_PROMPT", "TRUE", "TRUE = each run makes sure Excel's 'file format and extension don't match' warning is off for this user (Bloomberg opens its XLS export in Excel and that warning would stop the run). FALSE = leave Excel's setting alone.", ""
 
     AddDef "RULE", "MIN_Q", "3", "Minimum counterparties ASKED per quote request (Banco de Portugal: 3).", ""
     AddDef "RULE", "GROUP_LEVEL", "INQUIRY", "INQUIRY = each quote request (ID without its last characters) | ORDER = all requests for the same ISIN, side and trade date counted together.", "U"
@@ -128,6 +130,7 @@ Public Sub ApplyConfig(ByVal d As Object)
     RETRY_MIN = CLng(CfgNum(d, "RETRY_MIN"))
     ALERT_TO = CfgStr(d, "ALERT_TO")
     SHOW_POPUPS = CfgBool(d, "SHOW_POPUPS")
+    SILENCE_FORMAT_PROMPT = CfgBool(d, "SILENCE_FORMAT_PROMPT")
     MIN_Q = CLng(CfgNum(d, "MIN_Q"))
     GROUP_LEVEL = UCase$(CfgStr(d, "GROUP_LEVEL"))
     FILL_STATUS = LCase$(CfgStr(d, "FILL_STATUS"))
@@ -267,8 +270,8 @@ Public Sub WriteConfigSheet()
     ws.Columns(7).ColumnWidth = 70: ws.Columns(8).ColumnWidth = 2
     ws.Columns(9).ColumnWidth = 12: ws.Columns(10).ColumnWidth = 36
     WriteHolidayTable ws, hol, nHol
-    AddSheetButtons ws, Array("Validate Config|ValidateConfig", "Test Export|TestExport", "Install Daily Task|InstallDailyTask", _
-                              "Remove Daily Task|RemoveDailyTask", "Silence Format Prompt|SilenceFormatPrompt")
+    AddSheetButtons ws, Array("Validate Config|ValidateConfig", "Test Export|TestExport", "Import File|ImportFromFile", _
+                              "Process Pasted Data|ProcessPasted", "Install Daily Task|InstallDailyTask", "Remove Daily Task|RemoveDailyTask")
 End Sub
 
 Public Sub Hdr(rg As Range)
@@ -289,6 +292,29 @@ Public Function ExtensionHardening() As Long
     Exit Function
 NotSet:
     ExtensionHardening = 1
+End Function
+
+' IT policy value (HKCU\Software\Policies\...), -1 if no policy: a policy wins over the user setting
+Public Function ExtensionHardeningPolicy() As Long
+    On Error GoTo NotSet
+    ExtensionHardeningPolicy = CLng(CreateObject("WScript.Shell").RegRead(Replace(ExtHardeningKey(), "HKCU\Software\Microsoft\", "HKCU\Software\Policies\Microsoft\")))
+    Exit Function
+NotSet:
+    ExtensionHardeningPolicy = -1
+End Function
+
+' Used by every run (SILENCE_FORMAT_PROMPT = TRUE): turns the warning off once, silently. Returns a LOG line ("" = nothing to do).
+Public Function EnsureNoFormatPrompt() As String
+    Dim pol As Long
+    pol = ExtensionHardeningPolicy()
+    If pol >= 1 Then EnsureNoFormatPrompt = "Excel's format/extension warning is forced ON by an IT policy (ExtensionHardening = " & pol & "): ask IT to set it to 0, or Bloomberg's XLS will keep prompting.": Exit Function
+    If ExtensionHardening() = 0 Then Exit Function
+    On Error GoTo EH
+    CreateObject("WScript.Shell").RegWrite ExtHardeningKey(), 0, "REG_DWORD"
+    EnsureNoFormatPrompt = "Excel's 'file format and extension don't match' warning switched off for this user (" & ExtHardeningKey() & " = 0). If it still appears on this run, close and reopen Excel once."
+    Exit Function
+EH:
+    EnsureNoFormatPrompt = "Could not switch off Excel's format/extension warning: " & Err.Description
 End Function
 
 Public Sub SilenceFormatPrompt()
@@ -496,10 +522,14 @@ Public Function ValidateConfigCore(Optional ByRef nFail As Long, Optional ByRef 
             VAdd res, "SCHEDULE_MODE", "FAIL", "'" & SCHEDULE_MODE & "' is not TASK | WORKBOOK | OFF."
     End Select
     If ThisWorkbook.ReadOnly Then VAdd res, "Workbook", "FAIL", "Opened read-only: history cannot be saved." Else VAdd res, "Workbook", "PASS", ThisWorkbook.FullName
-    If ExtensionHardening() = 0 Then
+    If ExtensionHardeningPolicy() >= 1 Then
+        VAdd res, "Format prompt", "FAIL", "IT policy forces Excel's 'format and extension don't match' warning ON: Bloomberg's XLS will stop every run. Ask IT for ExtensionHardening = 0."
+    ElseIf ExtensionHardening() = 0 Then
         VAdd res, "Format prompt", "PASS", "Excel's 'format and extension don't match' warning is off for this user."
+    ElseIf SILENCE_FORMAT_PROMPT Then
+        VAdd res, "Format prompt", "PASS", "Will be switched off automatically by the next RUN BLOT CHECK."
     Else
-        VAdd res, "Format prompt", "WARN", "The workbook reads the export as data (no prompt). If BLOOMBERG opens the file in Excel after exporting, the prompt still appears: click Silence Format Prompt."
+        VAdd res, "Format prompt", "WARN", "SILENCE_FORMAT_PROMPT = FALSE: when Bloomberg opens its XLS in Excel, the warning stops the run until someone clicks it."
     End If
     If POLL_S < 1 Or TIMEOUT_S <= POLL_S Then VAdd res, "TIMEOUT_S / POLL_S", "FAIL", "Need POLL_S >= 1 and TIMEOUT_S > POLL_S." Else VAdd res, "TIMEOUT_S / POLL_S", "PASS", TIMEOUT_S & "s / " & POLL_S & "s"
     If Len(ALERT_TO) = 0 Then VAdd res, "ALERT_TO", "WARN", "No e-mail alerts." Else VAdd res, "ALERT_TO", "PASS", ALERT_TO

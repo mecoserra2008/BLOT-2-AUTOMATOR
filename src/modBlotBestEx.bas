@@ -69,7 +69,8 @@ Private gNoAccess As Long
 Private gPollAt As Date, gPollPending As Boolean, gCycleAt As Date, gCyclePending As Boolean
 Private gTestN As Long, gTestI As Long, gTestOK As Long, gLastErr As String, gWarned As String
 Private gScheduled As Boolean, gRetried As Boolean, gRetryAt As Date, gRetryPending As Boolean, gLastOK As Boolean
-Private gAlts As Collection, gAltI As Long, gCycleProc As String, gExeCache As Object, gWinBefore As String
+Private gAlts As Collection, gAltI As Long, gCycleProc As String, gExeCache As Object, gWinBefore As String, gClosed As Long
+Private gSavedFrom As String          ' file the dated copy was made from (set by SaveExport, used by TidyExport)
 
 '==========================================================================================
 '                                    ENTRY POINTS
@@ -85,6 +86,13 @@ Private Sub StartRun()
     If Not BeginRun("RUN") Then Exit Sub
     gLastOK = False
     Notify "Run started" & IIf(gScheduled, " (scheduled)", "") & ": expected trade date " & Format$(PrevBusinessDay(Date), "yyyy-mm-dd") & ".", LV_INFO
+    If Not Preflight() Then
+        FinishRun
+        Notify "Run stopped before the export: " & gLastErr, LV_ALERT
+        SetStatus "FAILED: " & gLastErr, True
+        MaybeRetry
+        Exit Sub
+    End If
     If Not StartAcquisition() Then OnAcquireTimeout
     Exit Sub
 EH:
@@ -204,6 +212,7 @@ Public Sub StartTestCycle()
     gTestI = gTestI + 1
     Application.StatusBar = "BLOT Test Export: cycle " & gTestI & "/" & gTestN
     Set gAlts = SplitAlts(EXPORT_SEQ): gAltI = 1
+    If Not Preflight() Then TestCycleDone False, gLastErr: Exit Sub
     If Not StartAcquisition() Then OnAcquireTimeout
     Exit Sub
 EH:
@@ -297,8 +306,7 @@ Private Function IsOwnSheet(ByVal nm As String) As Boolean
 End Function
 
 Public Function DashButtons() As Variant
-    DashButtons = Array("RUN BLOT CHECK|RunBlotReport|MAIN", "Process Pasted Data|ProcessPasted", "Import File|ImportFromFile", _
-                        "Test Export|TestExport", "Validate Config|ValidateConfig", "Abort|AbortRun")
+    DashButtons = Array("RUN BLOT CHECK|RunBlotReport|MAIN", "Abort|AbortRun")
 End Function
 
 Public Sub AddSheetButtons(ws As Worksheet, defs As Variant)
@@ -637,6 +645,7 @@ Private Sub HandleExport(v As Variant, vRaw As Variant, ByVal label As String, B
     PromoteVariant
     If gKind = "TEST" Then
         TestCycleDone True, label, v
+        TidyExport srcWb, srcFile, ""                         ' close what Bloomberg opened; nothing deleted
     Else
         ProcessData v, vRaw, label, srcWb, srcFile
         FinishRun
@@ -765,7 +774,11 @@ Private Function TryFile(ByVal f As String) As Boolean
         HandleExport blk("v"), blk("raw"), "file " & f, wb, f
         TryFile = True
     End If
-    If opened Then wb.Close False
+    If opened Then
+        On Error Resume Next                                  ' TidyExport may have closed it already
+        wb.Close False
+        On Error GoTo 0
+    End If
     Exit Function
 OpenFail:
     Application.DisplayAlerts = da
@@ -2239,7 +2252,7 @@ Private Function ProcessData(v As Variant, vRaw As Variant, ByVal srcLabel As St
 
     m = res("m"): ts = Now
     If m > 0 Then arch = SaveExport(srcWb, srcFile, vRaw, res("maxTD")) Else arch = SaveExport(srcWb, srcFile, vRaw, PrevBusinessDay(Date))
-    If Len(arch) > 0 Then WriteLog "Export saved: " & arch, LV_INFO
+    If Len(arch) > 0 And gKind <> "IMPORT" Then TidyExport srcWb, srcFile, arch
     If m = 0 Then
         WriteSheetTable GetSheet(SH_QUOTES), QuoteHeader(), Empty, 0
         Notify "ALERT: the export has no dealer rows (" & srcLabel & "). Confirm that the desk did not trade.", LV_ALERT
@@ -2290,20 +2303,32 @@ End Function
 ' regulatory evidence). File exports are copied (also while Excel has them open); open workbooks are
 ' saved with SaveCopyAs; if both fail the grid itself is written to a new .xlsx.
 Private Function SaveExport(ByVal srcWb As Object, ByVal srcFile As String, vRaw As Variant, ByVal td As Date) As String
-    Dim base As String, ext As String, p As String, wb As Workbook, fso As Object, dest As String
+    Dim base As String, ext As String, p As String, wb As Workbook, fso As Object, dest As String, why As String
     dest = EXPORT_FOLDER
+    gSavedFrom = ""
+    If Len(srcFile) = 0 And Not srcWb Is Nothing Then         ' workbook Bloomberg opened from a file: copy the exact bytes
+        On Error Resume Next
+        If Len(srcWb.Path) > 0 Then
+            If Len(Dir$(srcWb.FullName)) > 0 Then srcFile = srcWb.FullName
+        End If
+        On Error GoTo 0
+    End If
     If Len(dest) = 0 Then dest = ThisWorkbook.Path & "\BLOT_EXPORTS"
     EnsureFolder dest
     base = dest & "\BLOT_" & Format$(td, "yyyymmdd") & "_" & Format$(Now, "yyyymmdd_hhnnss")
     On Error GoTo TryWorkbook
     If Len(srcFile) > 0 Then
+        If gKind <> "IMPORT" Then gClosed = gClosed + CloseWorkbooksOf(srcFile, srcWb)   ' data already read; Excel locks open files
         p = base & KindExt(FileKind(srcFile))                ' true extension: opening it later never warns
         Set fso = CreateObject("Scripting.FileSystemObject")
         fso.CopyFile srcFile, p, True
         SaveExport = p
+        gSavedFrom = srcFile
+        WriteLog "Export saved (exact copy of " & srcFile & "): " & p, LV_INFO
         Exit Function
     End If
 TryWorkbook:
+    If Err.Number <> 0 Then why = "copy of " & srcFile & " failed: " & Err.Description
     On Error GoTo -1
     On Error GoTo Fallback
     If Not srcWb Is Nothing Then
@@ -2317,6 +2342,7 @@ TryWorkbook:
         p = base & ext
         srcWb.SaveCopyAs p
         SaveExport = p
+        WriteLog "Export saved (copy of the open workbook" & IIf(Len(why) > 0, "; " & why, "") & "): " & p, LV_INFO
         Exit Function
     End If
 Fallback:
@@ -2330,6 +2356,7 @@ Fallback:
     Application.DisplayAlerts = True
     wb.Close False
     SaveExport = p
+    WriteLog "Export saved (grid only" & IIf(Len(why) > 0, "; " & why, "") & "): " & p, LV_WARN
     Exit Function
 Failed:
     Application.DisplayAlerts = True
@@ -2531,7 +2558,7 @@ Private Sub BuildDashboard(out As Variant, ByVal m As Long, ByVal res As Object,
     ws.Range("B4").Value = "'" & info
     ws.Range("B4").Font.Italic = True: ws.Range("B4").Font.Color = RGB(89, 89, 89)
     If m = 0 Or res Is Nothing Then
-        ws.Range("B6").Value = "No data yet: Run Now, or paste the BLOT grid on PASTE and click Process Pasted Data."
+        ws.Range("B6").Value = "No data yet: click RUN BLOT CHECK (Bloomberg open and logged in)."
         ws.Columns("B").ColumnWidth = 40
         Exit Sub
     End If
@@ -2709,6 +2736,75 @@ Public Function GetSheet(ByVal nm As String) As Worksheet
         Set GetSheet = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
         GetSheet.Name = nm
     End If
+End Function
+
+' Checks done by RUN BLOT CHECK before touching Bloomberg (no popup): export folder, Excel's
+' format/extension warning, DDE link. False (reason in gLastErr) = do not start the export.
+Private Function Preflight() As Boolean
+    Dim msg As String, s As String
+    If Len(EXPORT_FOLDER) = 0 Then
+        EXPORT_FOLDER = ThisWorkbook.Path & "\BLOT_EXPORTS"
+        WriteLog "EXPORT_FOLDER empty on CONFIG: exports go to " & EXPORT_FOLDER, LV_WARN
+    End If
+    EnsureFolder EXPORT_FOLDER
+    If Len(Dir$(EXPORT_FOLDER, vbDirectory)) = 0 Then gLastErr = "EXPORT_FOLDER '" & EXPORT_FOLDER & "' does not exist and cannot be created.": Exit Function
+    If SILENCE_FORMAT_PROMPT And Not gHeadless Then
+        s = EnsureNoFormatPrompt()
+        If Len(s) > 0 Then WriteLog s, IIf(InStr(1, s, "could not", vbTextCompare) > 0 Or InStr(1, s, "policy", vbTextCompare) > 0, LV_WARN, LV_INFO)
+    End If
+    If InStr(1, OPEN_SEQ & "|" & EXPORT_SEQ, "KEYS:", vbTextCompare) > 0 Then
+        If Not DdeAvailable(msg) Then gLastErr = msg: Exit Function
+    End If
+    Preflight = True
+End Function
+
+' After the dated copy is saved: close the workbook(s) showing the export (Bloomberg opens it in
+' Excel), delete Bloomberg's own file when the copy is byte-identical (no stale file, no
+' "overwrite?" next time) and remove temporary copies. Nothing is left for the operator to close.
+Private Sub TidyExport(ByVal srcWb As Object, ByVal srcFile As String, ByVal saved As String)
+    Dim f As String, app As Object, wb As Object, i As Long, n As Long, tmp As String, t As String, sz1 As Double, sz2 As Double
+    On Error Resume Next
+    f = srcFile
+    If Len(f) = 0 Then f = gSavedFrom                       ' srcWb may be closed already: never read it here
+    n = gClosed + CloseWorkbooksOf(f, srcWb): gClosed = 0
+    If Len(f) > 0 And Len(saved) > 0 And StrComp(f, saved, vbTextCompare) <> 0 Then
+        sz1 = -1: sz2 = -2                                    ' read first: an error inside an If would enter it
+        If IsExportFileName(Mid$(f, InStrRev(f, "\") + 1)) Then
+            sz1 = FileLen(f)
+            sz2 = FileLen(saved)
+        End If
+        If sz1 > 0 And sz1 = sz2 Then
+            Kill f
+            If Len(Dir$(f)) = 0 Then WriteLog "Bloomberg's export file " & f & " removed (dated copy kept: " & saved & ").", LV_INFO
+        End If
+    End If
+    tmp = Environ$("TEMP") & "\"
+    t = Dir$(tmp & "blot_export_*.*")
+    Do While Len(t) > 0
+        Kill tmp & t
+        t = Dir$()
+    Loop
+    If n > 0 Then WriteLog n & " export workbook(s) closed.", LV_INFO
+End Sub
+
+' Closes (no save) every workbook, in any Excel instance, that shows file f or is wb; quits emptied instances
+Private Function CloseWorkbooksOf(ByVal f As String, ByVal wbX As Object) As Long
+    Dim app As Object, wb As Object, i As Long, n As Long
+    On Error Resume Next
+    For Each app In AllExcelApps()
+        For i = app.Workbooks.Count To 1 Step -1
+            Set wb = app.Workbooks(i)
+            If Not wb Is ThisWorkbook Then
+                If (Len(f) > 0 And StrComp(wb.FullName, f, vbTextCompare) = 0) Or (wb Is wbX) Then
+                    wb.Close SaveChanges:=False: n = n + 1
+                End If
+            End If
+        Next
+        If Not app Is Application Then
+            If app.Workbooks.Count = 0 Then app.Quit
+        End If
+    Next
+    CloseWorkbooksOf = n
 End Function
 
 ' Saves the workbook so the history survives (unattended runs never prompt)
