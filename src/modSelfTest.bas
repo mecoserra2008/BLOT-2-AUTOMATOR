@@ -196,9 +196,11 @@ Private Sub CompareResult(ByVal fx As String, ByVal cname As String, res As Obje
 
     Check fx, cname, "parse ok", "True", B2S(res("ok")) & IIf(Len(res("err")) > 0, " (" & res("err") & ")", "")
     For Each f In Array(Array("n_units", "m"), Array("n_requests", "nRequests"), Array("n_legs", "nLegs"), Array("n_filled", "nFilled"), _
-                        Array("n_breach", "nBreach"), Array("n_low", "nLow"), Array("n_key", "nKey"), Array("n_quoted_low", "nQuotedLow"))
+                        Array("n_breach", "nBreach"), Array("n_low", "nLow"), Array("n_key", "nKey"), Array("n_quoted_low", "nQuotedLow"), _
+                        Array("n_otc_review", "nOtcReview"), Array("n_linked", "nLinked"), Array("n_excluded", "nExcluded"))
         If ex.Exists(f(0)) Then Check fx, cname, CStr(f(0)), JInt(ex(f(0))), CStr(res(f(1)))
     Next
+    If ex.Exists("missing_cols") Then Check fx, cname, "missing columns", CStr(ex("missing_cols")), CStr(res("missingCols"))
     If ex.Exists("warning_contains") Then Check fx, cname, "warning contains '" & ex("warning_contains") & "'", "True", B2S(InStr(1, res("warnings"), CStr(ex("warning_contains")), vbTextCompare) > 0)
     If Not ex.Exists("units") Then Exit Sub
 
@@ -222,6 +224,9 @@ Private Sub CompareResult(ByVal fx As String, ByVal cname As String, res As Obje
             If e.Exists("filled") Then Check fx, cname, k & " filled", CStr(e("filled")), CStr(units(i, 10))
             If e.Exists("winner") Then Check fx, cname, k & " winner", CStr(e("winner")), CStr(units(i, 11))
             If e.Exists("check") Then Check fx, cname, k & " check", CStr(e("check")), CStr(units(i, 13))
+            If e.Exists("cohort") Then Check fx, cname, k & " cohort", CStr(e("cohort")), CStr(units(i, 19))
+            If e.Exists("cohort_asked") Then Check fx, cname, k & " cohort asked", CStr(e("cohort_asked")), CStr(units(i, 20))
+            If e.Exists("otc") Then Check fx, cname, k & " otc", CStr(e("otc")), CStr(units(i, 18))
         End If
     Next
     If ex.Exists("first_check") And m > 0 Then Check fx, cname, "worst first", CStr(ex("first_check")), CStr(units(1, 13))
@@ -284,12 +289,12 @@ Public Sub DumpSelfTestResults(ByVal outDir As String)
         p = outDir & Left$(it(0), Len(it(0)) - 4) & "__" & it(1) & ".csv"
         h = FreeFile
         Open p For Output As #h
-        Print #h, "key,date,requests,asked,quoted,filled,winner,check"
+        Print #h, "key,date,requests,asked,quoted,filled,winner,check,cohort,cohort_asked,otc"
         If res("m") > 0 Then
             u = res("units")
             For i = 1 To res("m")
                 Print #h, Q(u(i, 2)) & "," & Q(Format$(u(i, 1), "yyyy-mm-dd")) & "," & Q(u(i, 7)) & "," & Q(u(i, 8)) & "," & _
-                          Q(u(i, 9)) & "," & Q(u(i, 10)) & "," & Q(u(i, 11)) & "," & Q(u(i, 13))
+                          Q(u(i, 9)) & "," & Q(u(i, 10)) & "," & Q(u(i, 11)) & "," & Q(u(i, 13)) & "," & Q(u(i, 19)) & "," & Q(u(i, 20)) & "," & Q(u(i, 18))
             Next
         End If
         Close #h
@@ -389,6 +394,24 @@ Private Sub UnitTests()
     Check "unit", "pickup", "BLOT_BestEx copies never", "False", B2S(IsExportFileName("BLOT_BestEx_SITE.xlsx"))
     Check "unit", "pickup", "dated copies never", "False", B2S(IsExportFileName("BLOT_20261112_20261113_082901.xls"))
     Check "unit", "pickup", "Excel lock files never", "False", B2S(IsExportFileName("~$Blotter.xls"))
+
+    '--- v6: cohorts / OTC / excluded users ---
+    If IdTime("FITDNA:6AF5A88401180003", DateSerial(2026, 11, 12)) > 0 Then s = Format$(IdTime("FITDNA:6AF5A88401180003", DateSerial(2026, 11, 12)), "yyyy-mm-dd hh:nn:ss") Else s = "none"
+    Check "unit", "v6", "time in the request ID (UTC)", "2026-11-12 11:52:36", s
+    Check "unit", "v6", "ID time far from the trade date ignored", "0", CStr(IdTime("FITDNA:AAAA00000000A003", DateSerial(2026, 11, 12)))
+    Check "unit", "v6", "user name normalised", "ROGERIO SANTOS", NormUser("  rogerio   Santos ")
+    Check "unit", "v6", "user name without accents", "ROGERIO SANTOS", NormUser("Rog" & ChrW(233) & "rio Santos")
+    Check "unit", "v6", "default EXCLUDE_USERS", "True", B2S(ExcludeSet(EXCLUDE_USERS).Exists("ROGERIO SANTOS"))
+    Check "unit", "v6", "PNT TRUE", "True", B2S(IsTruthy("TRUE"))
+    Check "unit", "v6", "PNT Y", "True", B2S(IsTruthy("Y"))
+    Check "unit", "v6", "PNT blank", "False", B2S(IsTruthy(""))
+    Check "unit", "v6", "time text hh:mm:ss", "10:30:00", Format$(TimeOfCell("10:30:00", DateSerial(2026, 11, 12)), "hh:nn:ss")
+    a = HdrRow(Array("Security", "Side", "Status", "Qty (M)", "Price", "BrkrName", "Trade Dt", "ISIN", "ID", "Username", "PNT", "Issue Date", "Reoffer Price"))
+    Check "unit", "v6", "Username column", "10", CStr(HeaderIndex(a, HDR_USER))
+    Check "unit", "v6", "PNT column", "11", CStr(HeaderIndex(a, HDR_PNT))
+    Check "unit", "v6", "Issue Date column", "12", CStr(HeaderIndex(a, HDR_ISSUE_DATE))
+    Check "unit", "v6", "Re-offer column", "13", CStr(HeaderIndex(a, HDR_REOFFER))
+    Check "unit", "v6", "Trade Dt is not the issue date", "7", CStr(HeaderIndex(a, HDR_DATE))
 
     '--- one-button run ---
     Check "unit", "onego", "SILENCE_FORMAT_PROMPT default", "True", B2S(SILENCE_FORMAT_PROMPT)

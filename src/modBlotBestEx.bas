@@ -54,8 +54,8 @@ Private Const OBJID_NATIVEOM As Long = &HFFFFFFF0
 Private Const SW_RESTORE As Long = 9
 
 '------------------------------------ CONSTANTS ------------------------------------------
-Public Const UCOLS As Long = 16      ' INQUIRIES / HIST columns
-Public Const QCOLS As Long = 13      ' QUOTES columns
+Public Const UCOLS As Long = 21      ' INQUIRIES / HIST columns
+Public Const QCOLS As Long = 16      ' QUOTES columns
 Public Const LV_INFO  As String = "INFO"
 Public Const LV_WARN  As String = "WARN"
 Public Const LV_ALERT As String = "ALERT"
@@ -71,6 +71,7 @@ Private gTestN As Long, gTestI As Long, gTestOK As Long, gLastErr As String, gWa
 Private gScheduled As Boolean, gRetried As Boolean, gRetryAt As Date, gRetryPending As Boolean, gLastOK As Boolean
 Private gAlts As Collection, gAltI As Long, gCycleProc As String, gExeCache As Object, gWinBefore As String, gClosed As Long
 Private gSavedFrom As String          ' file the dated copy was made from (set by SaveExport, used by TidyExport)
+Private gColsTried As Boolean         ' COLUMNS_SEQ already run in this run
 
 '==========================================================================================
 '                                    ENTRY POINTS
@@ -211,7 +212,7 @@ Public Sub StartTestCycle()
     On Error GoTo EH
     gTestI = gTestI + 1
     Application.StatusBar = "BLOT Test Export: cycle " & gTestI & "/" & gTestN
-    Set gAlts = SplitAlts(EXPORT_SEQ): gAltI = 1
+    Set gAlts = SplitAlts(EXPORT_SEQ): gAltI = 1: gColsTried = False
     If Not Preflight() Then TestCycleDone False, gLastErr: Exit Sub
     If Not StartAcquisition() Then OnAcquireTimeout
     Exit Sub
@@ -524,7 +525,7 @@ Private Function BeginRun(ByVal kind As String) As Boolean
             Exit Function
         End If
     End If
-    gBusy = True: gKind = kind: gLastErr = "": gWarned = "|"
+    gBusy = True: gKind = kind: gLastErr = "": gWarned = "|": gColsTried = False
     gDeadline = Now + TimeSerial(0, 0, TIMEOUT_S)
     Set gAlts = SplitAlts(EXPORT_SEQ): gAltI = 1
     BeginRun = True
@@ -567,6 +568,10 @@ Private Function StartAcquisition() As Boolean
     If gAltI < gAlts.Count Then gDeadline = gT0 + TimeSerial(0, 0, ALT_WAIT_S) Else gDeadline = gT0 + TimeSerial(0, 0, TIMEOUT_S)
     SetStatus "1/3 Opening BLOT in Bloomberg...", False
     If Not RunSteps(ExpandSeq(OPEN_SEQ, Date)) Then gLastErr = "OPEN_SEQ failed: could not drive the Bloomberg Terminal (DDE).": Exit Function
+    If gColsTried And Len(COLUMNS_SEQ) > 0 Then
+        SetStatus "1/3 Adding the missing columns to the BLOT view...", False
+        If Not RunSteps(ExpandSeq(COLUMNS_SEQ, Date)) Then gLastErr = "COLUMNS_SEQ failed": Exit Function
+    End If
     SetStatus "2/3 Exporting the BLOT grid" & lbl & "...", False
     If Not RunSteps(ExpandSeq(seq, Date)) Then gLastErr = "export steps failed" & lbl & ": " & seq: Exit Function
     SetStatus "3/3 Waiting for the export file" & lbl & "...", False
@@ -642,6 +647,16 @@ Private Sub OnAcquireTimeout()
 End Sub
 
 Private Sub HandleExport(v As Variant, vRaw As Variant, ByVal label As String, ByVal srcWb As Object, ByVal srcFile As String)
+    Dim miss As String
+    miss = MissingColumns(v)
+    If Len(miss) > 0 And Len(COLUMNS_SEQ) > 0 And Not gColsTried And (gKind = "RUN" Or gKind = "TEST") Then
+        gColsTried = True
+        WriteLog "The export has no " & miss & " column: running COLUMNS_SEQ and exporting again.", LV_WARN
+        TidyExport srcWb, srcFile, ""
+        CancelPending
+        ArmCycle "NextExportVariant", 2
+        Exit Sub
+    End If
     PromoteVariant
     If gKind = "TEST" Then
         TestCycleDone True, label, v
@@ -660,7 +675,7 @@ Private Sub TestCycleDone(ByVal ok As Boolean, ByVal detail As String, Optional 
         gTestOK = gTestOK + 1
         If Not IsMissing(v) Then
             Set res = AnalyzeBlot(v, LoadDealerMap(), PrevBusinessDay(Date))
-            detail = detail & " | " & res("m") & " request(s), " & res("nFilled") & " filled | " & res("mapping")
+            detail = detail & " | " & res("m") & " request(s), " & res("nFilled") & " filled" & IIf(Len(res("missingCols")) > 0, " | MISSING COLUMNS: " & res("missingCols"), "") & " | " & res("mapping")
         End If
     End If
     Notify "TestExport cycle " & gTestI & "/" & gTestN & ": " & IIf(ok, "OK - ", "FAIL - ") & detail, IIf(ok, LV_INFO, LV_WARN), False, True
@@ -1712,30 +1727,45 @@ End Sub
 '                                    ANALYSIS CORE (pure: array in, result out)
 '==========================================================================================
 ' v = block, row 1 = header. Returns a Dictionary:
-'   ok, err, mapping, warnings, m (units), units (m x UCOLS), nLegs, legs (nLegs x QCOLS),
-'   nRequests, nFilled, nBreach, nLow, nKey, nQuotedLow, statuses, unmapped, minTD, maxTD
+'   ok, err, mapping, warnings, missingCols, m (units), units (m x UCOLS), nLegs, legs (nLegs x QCOLS),
+'   nRequests, nFilled, nBreach, nOtcReview, nLow, nKey, nLinked, nQuotedLow, nExcluded, excludedUsers,
+'   statuses, unmapped, minTD, maxTD
 ' Unit columns: 1 TradeDate | 2 Key | 3 Security | 4 ISIN | 5 Side | 6 Qty | 7 Requests | 8 Asked
 '   9 Quoted | 10 Filled | 11 Winner | 12 FillPrice | 13 Check | 14 Dealers | 15 LoadedAt | 16 Source
+'   17 Time | 18 OTC | 19 Cohort | 20 CohortAsked | 21 Link
 ' Leg columns: 1 TradeDate | 2 Key | 3 Request | 4 Security | 5 ISIN | 6 Side | 7 Qty | 8 BrkrName
-'   9 Dealer (normalized) | 10 Status | 11 Price | 12 Quoted | 13 Filled
+'   9 Dealer | 10 Status | 11 Price | 12 Quoted | 13 Filled | 14 Username | 15 PNT | 16 Time
+' Rows of the EXCLUDE_USERS (Username column) are left out before anything else.
+' Cohorts: a fill is joined with the earlier UNFILLED requests of the same day, ISIN and side:
+'   - electronic fill: same quantity (the request was not executed at the time, the fill came later)
+'   - OTC fill (PNT = TRUE): only when trade date = issue date AND fill price = re-offer price (any quantity)
+'   The cohort's asked = distinct dealers of the fill and of the joined requests.
+' Check: BREACH | OTC-REVIEW | KEY? | LOW | OK-LINKED | OK | LINKED (request joined to a later fill)
 Public Function AnalyzeBlot(v As Variant, dmap As Object, ByVal defTD As Date) As Object
-    Dim res As Object, hdr() As Variant, n As Long, nc As Long, i As Long, j As Long, u As Long, m As Long
+    Dim res As Object, hdr() As Variant, n As Long, nc As Long, i As Long, j As Long, u As Long, m As Long, w As Long
     Dim cDl As Long, cID As Long, cSec As Long, cIsin As Long, cSide As Long, cSt As Long, cQty As Long, cPx As Long, cDt As Long
+    Dim cUser As Long, cPnt As Long, cIss As Long, cReo As Long, cTime As Long
     Dim idx As Object, inqIsin As Object, inqSide As Object, inqDate As Object, badInq As Object, reqs As Object
     Dim bondRows As Object, bondInq As Object, stSeen As Object, unm As Object, ents As Object, kk As Variant
+    Dim exList As Object, exSeen As Object
     Dim uDate() As Date, uKey() As String, uSec() As String, uIsin() As String, uSide() As String, uQty() As Variant
     Dim uInq() As Object, uAsk() As Object, uQuo() As Object, uFill() As Boolean, uWin() As String, uPx() As Variant
+    Dim uT() As Double, uOtc() As Boolean, uIss() As Date, uReo() As Double, uQn() As Double, uBad() As Boolean
+    Dim head() As Long, isHead() As Boolean, uLink() As String, cAsk() As Long, chk() As String, rk() As Double
     Dim legs() As Variant, nLegs As Long, d As Date, dlr As String, nm As String, st As String, px As Double
     Dim isin As String, sec As String, sideU As String, qty As String, inq As String, uk As String, bk As String
-    Dim isQ As Boolean, isF As Boolean, nNoDl As Long, nFb As Long, warn As String, s As String
-    Dim out() As Variant, ord() As Long, rk() As Long, t As Long, chk As String, bad As Boolean
+    Dim isQ As Boolean, isF As Boolean, isP As Boolean, nNoDl As Long, nFb As Long, warn As String, s As String
+    Dim out() As Variant, ord() As Long, t As Long, tRow As Double, dIss As Date, miss As String, usr As String
     Dim nFilled As Long, nBreach As Long, nLow As Long, nKey As Long, nQLow As Long, nSusp As Long
-    Dim minTD As Date, maxTD As Date
+    Dim nOtcR As Long, nLinked As Long, nExcl As Long, minTD As Date, maxTD As Date
+    Dim tOrd() As Long, cands As Collection, sel As Collection, cv As Variant, uni As Object, l2 As Boolean
+    Dim why As String, lst As String, h As Long, a As Long, tmpD As Double
 
     Set res = NewDict()
-    res("ok") = False: res("err") = "": res("mapping") = "": res("warnings") = "": res("m") = 0
+    res("ok") = False: res("err") = "": res("mapping") = "": res("warnings") = "": res("missingCols") = "": res("m") = 0
     res("units") = Empty: res("nLegs") = 0: res("legs") = Empty: res("nRequests") = 0
-    res("nFilled") = 0: res("nBreach") = 0: res("nLow") = 0: res("nKey") = 0: res("nQuotedLow") = 0
+    res("nFilled") = 0: res("nBreach") = 0: res("nOtcReview") = 0: res("nLow") = 0: res("nKey") = 0
+    res("nLinked") = 0: res("nQuotedLow") = 0: res("nExcluded") = 0: res("excludedUsers") = ""
     res("statuses") = "": res("unmapped") = "": res("minTD") = 0: res("maxTD") = 0
     If Not IsArray(v) Then res("err") = "No data.": GoTo Done
     n = UBound(v, 1): nc = UBound(v, 2)
@@ -1746,24 +1776,37 @@ Public Function AnalyzeBlot(v As Variant, dmap As Object, ByVal defTD As Date) A
     cSec = HeaderIndex(hdr, HDR_SECURITY): cIsin = HeaderIndex(hdr, HDR_ISIN)
     cSide = HeaderIndex(hdr, HDR_SIDE):   cSt = HeaderIndex(hdr, HDR_STATUS)
     cQty = HeaderIndex(hdr, HDR_QTY):     cPx = HeaderIndex(hdr, HDR_PRICE)
-    cDt = HeaderIndex(hdr, HDR_DATE)
+    cDt = HeaderIndex(hdr, HDR_DATE):     cUser = HeaderIndex(hdr, HDR_USER)
+    cPnt = HeaderIndex(hdr, HDR_PNT):     cIss = HeaderIndex(hdr, HDR_ISSUE_DATE)
+    cReo = HeaderIndex(hdr, HDR_REOFFER): cTime = HeaderIndex(hdr, HDR_TIME)
     res("mapping") = "Columns: " & MapDesc(hdr, Array("DEALER", cDl, "ID", cID, "SECURITY", cSec, "ISIN", cIsin, "SIDE", cSide, _
-                     "STATUS", cSt, "QTY", cQty, "PRICE", cPx, "DATE", cDt))
+                     "STATUS", cSt, "QTY", cQty, "PRICE", cPx, "DATE", cDt, "USER", cUser, "PNT", cPnt, _
+                     "ISSUE", cIss, "REOFFER", cReo, "TIME", cTime))
     If cDl = 0 Then res("err") = "Dealer column not found (HDR_DEALER).": GoTo Done
     If cID = 0 And cIsin = 0 Then res("err") = "Neither an ID nor an ISIN column found (HDR_ID / HDR_ISIN).": GoTo Done
     If cID = 0 Then warn = warn & "No ID column: requests grouped by trade date | ISIN | side | qty. "
     If cSt = 0 Then warn = warn & "No status column: no request can be recognised as filled. "
     If cPx = 0 Then warn = warn & "No price column: 'quoted' cannot be measured. "
+    Set exList = ExcludeSet(EXCLUDE_USERS)
+    If cPnt = 0 Then miss = miss & "PNT, ": warn = warn & "No PNT column: OTC executions cannot be recognised. "
+    If cUser = 0 And exList.Count > 0 Then miss = miss & "Username, ": warn = warn & "No Username column: EXCLUDE_USERS (" & EXCLUDE_USERS & ") NOT applied. "
+    If cIss = 0 Or cReo = 0 Then warn = warn & "No issue-date / re-offer column: OTC fills cannot be joined to their requests (they stay OTC-REVIEW). "
+    If Len(miss) > 0 Then res("missingCols") = Left$(miss, Len(miss) - 2)
 
     Set idx = NewDict(): Set inqIsin = NewDict(): Set inqSide = NewDict(): Set inqDate = NewDict()
     Set badInq = NewDict(): Set reqs = NewDict(): Set bondRows = NewDict(): Set bondInq = NewDict()
-    Set stSeen = NewDict(): Set unm = NewDict(): Set ents = NewDict()
+    Set stSeen = NewDict(): Set unm = NewDict(): Set ents = NewDict(): Set exSeen = NewDict()
     For Each kk In dmap.Keys: ents(dmap(kk)) = 1: Next
     ReDim uDate(1 To n): ReDim uKey(1 To n): ReDim uSec(1 To n): ReDim uIsin(1 To n): ReDim uSide(1 To n)
     ReDim uQty(1 To n): ReDim uInq(1 To n): ReDim uAsk(1 To n): ReDim uQuo(1 To n): ReDim uFill(1 To n)
-    ReDim uWin(1 To n): ReDim uPx(1 To n): ReDim legs(1 To n, 1 To QCOLS)
+    ReDim uWin(1 To n): ReDim uPx(1 To n): ReDim uT(1 To n): ReDim uOtc(1 To n): ReDim uIss(1 To n)
+    ReDim uReo(1 To n): ReDim uQn(1 To n): ReDim uBad(1 To n): ReDim legs(1 To n, 1 To QCOLS)
 
     For i = 2 To n
+        If cUser > 0 And exList.Count > 0 Then                ' EXCLUDE_USERS: out of the analysis
+            usr = CellS(v, i, cUser)
+            If exList.Exists(NormUser(usr)) Then nExcl = nExcl + 1: exSeen(usr) = 1: GoTo NextRow
+        End If
         dlr = CellS(v, i, cDl)
         If Len(dlr) = 0 Then
             If Len(CellS(v, i, cID)) + Len(CellS(v, i, cIsin)) + Len(CellS(v, i, cSec)) > 0 Then nNoDl = nNoDl + 1
@@ -1791,6 +1834,7 @@ Public Function AnalyzeBlot(v As Variant, dmap As Object, ByVal defTD As Date) A
             m = m + 1: idx(uk) = m
             uDate(m) = d: uKey(m) = uk: uSec(m) = sec: uIsin(m) = isin: uSide(m) = CellS(v, i, cSide)
             uQty(m) = NumOrText(v, i, cQty)
+            If cQty > 0 Then uQn(m) = PriceOf(v(i, cQty))
             Set uInq(m) = NewDict(): Set uAsk(m) = NewDict(): Set uQuo(m) = NewDict()
             uPx(m) = Empty
         End If
@@ -1798,6 +1842,18 @@ Public Function AnalyzeBlot(v As Variant, dmap As Object, ByVal defTD As Date) A
         uInq(u)(inq) = 1
         If Len(uSec(u)) = 0 Then uSec(u) = sec
         If Len(uIsin(u)) = 0 Then uIsin(u) = isin
+
+        ' time of the request: time column, else the creation time encoded in the ID
+        tRow = 0
+        If cTime > 0 Then tRow = TimeOfCell(v(i, cTime), d)
+        If tRow = 0 And cID > 0 Then tRow = IdTime(CellS(v, i, cID), d)
+        If tRow > 0 Then
+            If uT(u) = 0 Or tRow < uT(u) Then uT(u) = tRow
+        End If
+        If cIss > 0 And CLng(uIss(u)) = 0 Then
+            If ParseDateCell(v(i, cIss), DATE_FORMAT_TEXT, dIss) Then uIss(u) = dIss
+        End If
+        If cReo > 0 And uReo(u) = 0 Then uReo(u) = PriceOf(v(i, cReo))
 
         nm = NormName(dlr)
         If dmap.Exists(nm) Then
@@ -1811,12 +1867,16 @@ Public Function AnalyzeBlot(v As Variant, dmap As Object, ByVal defTD As Date) A
         px = 0
         If cPx > 0 Then px = PriceOf(v(i, cPx))
         isQ = (px > 0)
-        isF = IsFilledStatus(st)
+        isP = False
+        If cPnt > 0 Then isP = IsTruthy(CellS(v, i, cPnt))
+        isF = IsFilledStatus(st) Or (isP And Not IsKilledStatus(st))       ' an OTC ticket is an execution
+        If isP Then s = s & " OTC"
         If isQ Then s = s & " @" & InvariantNum(px)
         If uAsk(u).Exists(nm) Then uAsk(u)(nm) = uAsk(u)(nm) & " / " & s Else uAsk(u)(nm) = s
         If isQ Then uQuo(u)(nm) = 1
         If isF Then
             uFill(u) = True
+            If isP Then uOtc(u) = True
             If InStr(1, ";" & uWin(u) & ";", ";" & nm & ";") = 0 Then
                 If Len(uWin(u)) > 0 Then uWin(u) = uWin(u) & ";"
                 uWin(u) = uWin(u) & nm
@@ -1835,41 +1895,138 @@ Public Function AnalyzeBlot(v As Variant, dmap As Object, ByVal defTD As Date) A
         legs(nLegs, 9) = nm: legs(nLegs, 10) = st
         If isQ Then legs(nLegs, 11) = px Else legs(nLegs, 11) = ""
         legs(nLegs, 12) = IIf(isQ, "YES", "NO"): legs(nLegs, 13) = IIf(isF, "YES", "NO")
+        legs(nLegs, 14) = CellS(v, i, cUser): legs(nLegs, 15) = IIf(isP, "YES", "")
+        If tRow > 0 Then legs(nLegs, 16) = Format$(tRow, "hh:nn:ss") Else legs(nLegs, 16) = ""
 NextRow:
     Next
 
-    ' one request per dealer row for the same bond/side/day/qty = the ID rule is probably wrong
     For Each kk In bondRows.Keys
         If bondRows(kk) >= 2 And bondInq(kk).Count = bondRows(kk) Then nSusp = nSusp + 1
     Next
 
-    ' output, worst first: BREACH, KEY?, LOW, OK filled, OK not filled
     If m > 0 Then
-        ReDim out(1 To m, 1 To UCOLS): ReDim rk(1 To m): ReDim ord(1 To m)
+        ReDim head(1 To m): ReDim isHead(1 To m): ReDim uLink(1 To m): ReDim cAsk(1 To m)
+        ReDim chk(1 To m): ReDim rk(1 To m): ReDim ord(1 To m): ReDim tOrd(1 To m)
         For u = 1 To m
-            bad = False
             For Each kk In uInq(u).Keys
-                If badInq.Exists(kk) Then bad = True
+                If badInq.Exists(kk) Then uBad(u) = True
             Next
-            If bad Then
-                chk = "KEY?": nKey = nKey + 1: rk(u) = 1
-            ElseIf uAsk(u).Count < MIN_Q Then
-                If uFill(u) Then
-                    chk = "BREACH": nBreach = nBreach + 1: rk(u) = 0
-                Else
-                    chk = "LOW": nLow = nLow + 1: rk(u) = 2
+            tOrd(u) = u
+        Next
+        For i = 2 To m                                        ' fills are processed in time order
+            t = tOrd(i): j = i - 1
+            Do While j >= 1
+                If Not TimeAfter(uT(tOrd(j)), uT(t)) Then Exit Do
+                tOrd(j + 1) = tOrd(j): j = j - 1
+            Loop
+            tOrd(j + 1) = t
+        Next
+
+        '--- cohorts: join a fill with the earlier unfilled requests of the same day / ISIN / side ---
+        For t = 1 To m
+            u = tOrd(t)
+            If uFill(u) And Not uBad(u) Then
+                Set cands = New Collection
+                For w = 1 To m
+                    If w <> u And Not uFill(w) And Not uBad(w) And head(w) = 0 Then
+                        If CLng(uDate(w)) = CLng(uDate(u)) And BondKey(uIsin(w), uSec(w)) = BondKey(uIsin(u), uSec(u)) _
+                           And UCase$(uSide(w)) = UCase$(uSide(u)) Then
+                            If uT(w) = 0 Or uT(u) = 0 Or uT(w) <= uT(u) Then cands.Add w
+                        End If
+                    End If
+                Next
+                Set sel = Nothing: why = ""
+                If uOtc(u) And uAsk(u).Count < MIN_Q Then
+                    l2 = (cIss > 0 And cReo > 0)
+                    If l2 Then l2 = (CLng(uIss(u)) > 0 And CLng(uIss(u)) = CLng(uDate(u)))
+                    If l2 Then l2 = (uReo(u) > 0 And Not IsEmpty(uPx(u)))
+                    If l2 Then l2 = (Abs(CDbl(uPx(u)) - uReo(u)) <= PX_TOL)
+                    If l2 And cands.Count > 0 Then
+                        Set sel = cands: why = "OTC fill at the re-offer price on the issue date"
+                    Else
+                        chk(u) = "OTC-REVIEW"
+                        If Not l2 Then
+                            uLink(u) = "OTC fill (PNT) without competition: not at the re-offer price on the issue date"
+                        Else
+                            uLink(u) = "OTC fill (PNT) at re-offer, but no earlier request for this ISIN / side today"
+                        End If
+                    End If
+                ElseIf LINK_LATER_FILLS Then
+                    Set sel = New Collection
+                    For Each cv In cands
+                        If uQn(u) <> 0 And Abs(uQn(cv) - uQn(u)) < 0.0000001 Then sel.Add cv
+                    Next
+                    why = "later fill of the same ISIN, side and quantity"
                 End If
-            Else
-                chk = "OK"
-                If uFill(u) Then rk(u) = 3 Else rk(u) = 4
+                If Not sel Is Nothing Then
+                    If sel.Count > 0 Then
+                        Set uni = NewDict(): lst = ""
+                        For Each kk In uAsk(u).Keys: uni(kk) = 1: Next
+                        For Each cv In sel
+                            w = cv: head(w) = u
+                            For Each kk In uAsk(w).Keys: uni(kk) = 1: Next
+                            If Len(lst) > 0 Then lst = lst & ", "
+                            lst = lst & uKey(w)
+                            uLink(w) = "joined to the fill " & uKey(u)
+                        Next
+                        isHead(u) = True: cAsk(u) = uni.Count: nLinked = nLinked + 1
+                        uLink(u) = why & ": joined " & sel.Count & " earlier request(s) " & lst & " (dealers: " & uAsk(u).Count & " own, " & uni.Count & " in the cohort)"
+                    End If
+                End If
             End If
+        Next
+
+        '--- checks ---
+        For u = 1 To m
+            If uBad(u) Then
+                chk(u) = "KEY?"
+            ElseIf chk(u) = "OTC-REVIEW" Then
+            ElseIf head(u) > 0 Then
+                chk(u) = "LINKED"
+            ElseIf uFill(u) Then
+                If isHead(u) Then a = cAsk(u) Else a = uAsk(u).Count
+                If a < MIN_Q Then
+                    chk(u) = "BREACH"
+                ElseIf isHead(u) Then
+                    chk(u) = "OK-LINKED"
+                Else
+                    chk(u) = "OK"
+                End If
+            ElseIf uAsk(u).Count < MIN_Q Then
+                chk(u) = "LOW"
+            Else
+                chk(u) = "OK"
+            End If
+        Next
+
+        '--- output, worst first; joined requests right after their fill ---
+        ReDim out(1 To m, 1 To UCOLS)
+        For u = 1 To m
+            If head(u) > 0 Then h = head(u) Else h = u
+            rk(u) = CheckRank(chk(h), uFill(h)) * 10000000# + h * 10# + IIf(head(u) > 0, 1, 0)
+            Select Case chk(u)
+                Case "BREACH": nBreach = nBreach + 1
+                Case "OTC-REVIEW": nOtcR = nOtcR + 1
+                Case "KEY?": nKey = nKey + 1
+                Case "LOW": nLow = nLow + 1
+            End Select
             If uFill(u) Then nFilled = nFilled + 1
-            If uQuo(u).Count < MIN_Q Then nQLow = nQLow + 1
+            If uQuo(u).Count < MIN_Q And chk(u) <> "LINKED" Then nQLow = nQLow + 1
             out(u, 1) = uDate(u): out(u, 2) = uKey(u): out(u, 3) = uSec(u): out(u, 4) = uIsin(u): out(u, 5) = uSide(u)
             out(u, 6) = uQty(u): out(u, 7) = uInq(u).Count: out(u, 8) = uAsk(u).Count: out(u, 9) = uQuo(u).Count
             out(u, 10) = IIf(uFill(u), "YES", "NO"): out(u, 11) = uWin(u)
             If IsEmpty(uPx(u)) Then out(u, 12) = "" Else out(u, 12) = uPx(u)
-            out(u, 13) = chk: out(u, 14) = DealerDetail(uAsk(u)): out(u, 15) = Empty: out(u, 16) = ""
+            out(u, 13) = chk(u): out(u, 14) = DealerDetail(uAsk(u)): out(u, 15) = Empty: out(u, 16) = ""
+            If uT(u) > 0 Then out(u, 17) = Format$(uT(u), "hh:nn:ss") Else out(u, 17) = ""
+            out(u, 18) = IIf(uOtc(u), "YES", "")
+            If isHead(u) Then
+                out(u, 19) = uKey(u): out(u, 20) = cAsk(u)
+            ElseIf head(u) > 0 Then
+                out(u, 19) = uKey(head(u)): out(u, 20) = ""
+            Else
+                out(u, 19) = "": out(u, 20) = ""
+            End If
+            out(u, 21) = uLink(u)
             If minTD = 0 Or uDate(u) < minTD Then minTD = uDate(u)
             If uDate(u) > maxTD Then maxTD = uDate(u)
             ord(u) = u
@@ -1886,6 +2043,7 @@ NextRow:
     End If
     If nLegs > 0 Then res("legs") = TrimRows(legs, nLegs)
 
+    If nExcl > 0 Then warn = warn & nExcl & " row(s) of " & KeyList(exSeen, ", ") & " excluded (EXCLUDE_USERS). "
     If nNoDl > 0 Then warn = warn & nNoDl & " row(s) without dealer ignored. "
     If nFb > 0 Then warn = warn & nFb & " row(s) without a readable trade date: " & Format$(defTD, "yyyy-mm-dd") & " used (check DATE_FORMAT_TEXT). "
     If maxTD > Date Then warn = warn & "Trade date " & Format$(maxTD, "yyyy-mm-dd") & " is in the future: day and month swapped? Check DATE_FORMAT_TEXT (" & DATE_FORMAT_TEXT & "). "
@@ -1893,12 +2051,127 @@ NextRow:
     If nKey > 0 Then warn = warn & nKey & " request(s) mix ISINs, sides or dates under one ID (KEY?). "
     res("ok") = True
     res("m") = m: res("nLegs") = nLegs: res("nRequests") = reqs.Count
-    res("nFilled") = nFilled: res("nBreach") = nBreach: res("nLow") = nLow: res("nKey") = nKey: res("nQuotedLow") = nQLow
+    res("nFilled") = nFilled: res("nBreach") = nBreach: res("nOtcReview") = nOtcR: res("nLow") = nLow
+    res("nKey") = nKey: res("nLinked") = nLinked: res("nQuotedLow") = nQLow
+    res("nExcluded") = nExcl: res("excludedUsers") = KeyList(exSeen, ", ")
     res("statuses") = CountList(stSeen): res("unmapped") = KeyList(unm, ", ")
     res("minTD") = minTD: res("maxTD") = maxTD
 Done:
     res("warnings") = Trim$(warn)
     Set AnalyzeBlot = res
+End Function
+
+' Order of the dashboard: alerts first
+Public Function CheckRank(ByVal chk As String, ByVal filled As Boolean) As Long
+    Select Case chk
+        Case "BREACH": CheckRank = 0
+        Case "OTC-REVIEW": CheckRank = 1
+        Case "KEY?": CheckRank = 2
+        Case "LOW": CheckRank = 3
+        Case "OK-LINKED": CheckRank = 4
+        Case Else: If filled Then CheckRank = 5 Else CheckRank = 6
+    End Select
+End Function
+
+' t1 later than t2 (an unknown time, 0, is never "later")
+Private Function TimeAfter(ByVal t1 As Double, ByVal t2 As Double) As Boolean
+    If t1 = 0 Or t2 = 0 Then Exit Function
+    TimeAfter = (t1 > t2)
+End Function
+
+Private Function BondKey(ByVal isin As String, ByVal sec As String) As String
+    If Len(isin) > 0 Then BondKey = UCase$(isin) Else BondKey = UCase$(sec)
+End Function
+
+' Creation time encoded in a Bloomberg request ID: the first 8 hex digits after the last ':' are Unix
+' seconds (FITDNA:6AF5A884... = 2026-11-12 11:52:36 UTC). Used only if it falls within a day of the trade date.
+Public Function IdTime(ByVal id As String, ByVal d As Date) As Double
+    Dim p As Long, hx As String, i As Long, secs As Double, t As Double, k As Long
+    id = Trim$(id)
+    p = InStrRev(id, ":")
+    hx = UCase$(Mid$(id, p + 1, 8))
+    If Len(hx) < 8 Then Exit Function
+    For i = 1 To 8
+        k = InStr(1, "0123456789ABCDEF", Mid$(hx, i, 1))
+        If k = 0 Then Exit Function
+        secs = secs * 16# + (k - 1)
+    Next
+    t = 25569# + secs / 86400#
+    If Abs(Int(t) - CDbl(Int(CDbl(d)))) <= 1 Then IdTime = t
+End Function
+
+' Time cell: fraction of day, date-time serial, "hh:mm[:ss]" or "yyyy-mm-dd hh:mm[:ss]" text; 0 if none
+Public Function TimeOfCell(ByVal x As Variant, ByVal d As Date) As Double
+    Dim s As String, p As Long, tt As Date, dd As Date
+    Select Case VarType(x)
+        Case vbDouble, vbSingle, vbDate, vbCurrency, vbDecimal
+            If CDbl(x) > 0 And CDbl(x) < 1 Then
+                TimeOfCell = CDbl(Int(CDbl(d))) + CDbl(x)
+            ElseIf CDbl(x) >= 1 And CDbl(x) < 2958466 Then
+                TimeOfCell = CDbl(x)
+            End If
+        Case vbString
+            s = Trim$(x)
+            p = InStrRev(s, " ")
+            If p > 0 Then
+                If ParseTimeStr(Mid$(s, p + 1), tt) And ParseDateText(Left$(s, p - 1), DATE_FORMAT_TEXT, dd) Then TimeOfCell = CDbl(dd) + CDbl(tt)
+            ElseIf ParseTimeStr(s, tt) Then
+                TimeOfCell = CDbl(Int(CDbl(d))) + CDbl(tt)
+            End If
+    End Select
+End Function
+
+' PNT and similar flags: TRUE / Y / YES / 1 / X / SIM / VERDADEIRO
+Public Function IsTruthy(ByVal s As String) As Boolean
+    Select Case UCase$(Trim$(s))
+        Case "TRUE", "Y", "YES", "1", "X", "SIM", "S", "VERDADEIRO", "-1"
+            IsTruthy = True
+    End Select
+End Function
+
+Private Function IsKilledStatus(ByVal st As String) As Boolean
+    st = LCase$(st)
+    IsKilledStatus = (InStr(1, st, "cancel") > 0 Or InStr(1, st, "reject") > 0)
+End Function
+
+' EXCLUDE_USERS ("ROGERIO SANTOS|..." , ';' also accepted) as a set of normalized names
+Public Function ExcludeSet(ByVal s As String) As Object
+    Dim d As Object, a As Variant, t As String
+    Set d = NewDict()
+    For Each a In Split(Replace(s, ";", "|"), "|")
+        t = NormUser(CStr(a))
+        If Len(t) > 0 Then d(t) = 1
+    Next
+    Set ExcludeSet = d
+End Function
+
+' User names compared without accents, case or repeated spaces (Rogerio = ROGERIO = Rog&eacute;rio)
+Public Function NormUser(ByVal s As String) As String
+    NormUser = NormName(StripAccents(s))
+End Function
+
+Public Function StripAccents(ByVal s As String) As String
+    Dim a As String, b As String, i As Long
+    a = ChrW(224) & ChrW(225) & ChrW(226) & ChrW(227) & ChrW(228) & ChrW(231) & ChrW(232) & ChrW(233) & ChrW(234) & ChrW(235) & _
+        ChrW(236) & ChrW(237) & ChrW(238) & ChrW(239) & ChrW(242) & ChrW(243) & ChrW(244) & ChrW(245) & ChrW(246) & _
+        ChrW(249) & ChrW(250) & ChrW(251) & ChrW(252)
+    b = "aaaaaceeeeiiiiooooouuuu"
+    s = LCase$(s)
+    For i = 1 To Len(a)
+        s = Replace(s, Mid$(a, i, 1), Mid$(b, i, 1))
+    Next
+    StripAccents = s
+End Function
+
+' Columns that must be in the export for the v6 rules ("" = all there): PNT, and Username when EXCLUDE_USERS is set
+Public Function MissingColumns(v As Variant) As String
+    Dim hdr() As Variant, j As Long, s As String
+    If Not IsArray(v) Then Exit Function
+    ReDim hdr(1 To 1, 1 To UBound(v, 2))
+    For j = 1 To UBound(v, 2): hdr(1, j) = v(1, j): Next
+    If HeaderIndex(hdr, HDR_PNT) = 0 Then s = s & "PNT, "
+    If HeaderIndex(hdr, HDR_USER) = 0 And ExcludeSet(EXCLUDE_USERS).Count > 0 Then s = s & "Username, "
+    If Len(s) > 0 Then MissingColumns = Left$(s, Len(s) - 2)
 End Function
 
 ' Request key: ID without its dealer-leg suffix; without ID: trade date | ISIN | side | qty
@@ -2273,12 +2546,15 @@ Private Function ProcessData(v As Variant, vRaw As Variant, ByVal srcLabel As St
     BuildDashboard out, m, res, info
 
     msg = "Trades " & DateRangeText(res("minTD"), res("maxTD")) & ": " & m & " request(s), " & res("nFilled") & " filled, " & _
-          res("nBreach") & " BREACH (filled, < " & MIN_Q & " asked), " & res("nLow") & " LOW (not filled, < " & MIN_Q & " asked), " & res("nKey") & " KEY?"
-    If res("nBreach") > 0 Or res("nKey") > 0 Then
+          res("nBreach") & " BREACH, " & res("nOtcReview") & " OTC-REVIEW, " & res("nLow") & " LOW, " & res("nKey") & " KEY?, " & _
+          res("nLinked") & " cohort(s) joined, " & res("nExcluded") & " row(s) excluded"
+    If Len(res("missingCols")) > 0 Then msg = msg & " | MISSING COLUMNS: " & res("missingCols")
+    If res("nBreach") > 0 Or res("nOtcReview") > 0 Or res("nKey") > 0 Then
         For i = 1 To m
-            If out(i, 13) = "BREACH" Or out(i, 13) = "KEY?" Then
-                lst = lst & vbLf & "[" & out(i, 13) & "] " & Format$(out(i, 1), "yyyy-mm-dd") & "  " & out(i, 3) & "  " & out(i, 4) & "  " & out(i, 5) & _
-                      "  asked=" & out(i, 8) & " quoted=" & out(i, 9) & "  winner=" & out(i, 11) & "  " & out(i, 14)
+            If out(i, 13) = "BREACH" Or out(i, 13) = "OTC-REVIEW" Or out(i, 13) = "KEY?" Then
+                lst = lst & vbLf & "[" & out(i, 13) & "] " & Format$(out(i, 1), "yyyy-mm-dd") & " " & out(i, 17) & "  " & out(i, 3) & "  " & out(i, 4) & "  " & out(i, 5) & _
+                      "  qty=" & out(i, 6) & "  asked=" & out(i, 8) & IIf(Len(CStr(out(i, 20))) > 0, " (cohort " & out(i, 20) & ")", "") & _
+                      "  winner=" & out(i, 11) & IIf(out(i, 18) = "YES", " OTC", "") & "  " & out(i, 21) & "  " & out(i, 14)
             End If
         Next
         Notify "ALERT " & msg & lst, LV_ALERT
@@ -2286,7 +2562,9 @@ Private Function ProcessData(v As Variant, vRaw As Variant, ByVal srcLabel As St
         Notify "OK " & msg, LV_INFO
     End If
     If Len(gaps) > 0 Then Notify "ALERT coverage gap: no BLOT data for business day(s) " & gaps & ". Load them with Import File.", LV_ALERT
-    SetStatus "DONE " & Format$(Now, "hh:nn") & ": " & m & " request(s), " & res("nFilled") & " filled, " & res("nBreach") & " BREACH, " & res("nLow") & " LOW.", res("nBreach") > 0
+    SetStatus "DONE " & Format$(Now, "hh:nn") & ": " & m & " request(s), " & res("nFilled") & " filled, " & res("nBreach") & " BREACH, " & _
+              res("nOtcReview") & " OTC-REVIEW, " & res("nLinked") & " cohort(s)" & IIf(Len(res("missingCols")) > 0, " | MISSING COLUMNS: " & res("missingCols"), "") & ".", _
+              res("nBreach") + res("nOtcReview") > 0 Or Len(res("missingCols")) > 0
     If gKind = "RUN" Then SetLastOkRun
     SaveHistory
     ProcessData = True
@@ -2371,15 +2649,16 @@ End Function
 '==========================================================================================
 Public Function UnitHeader() As Variant
     UnitHeader = Array("TradeDate", "Key", "Security", "ISIN", "Side", "Qty", "Requests", "Asked", "Quoted", "Filled", _
-                       "Winner", "FillPrice", "Check", "Dealers [status @price]", "LoadedAt", "Source")
+                       "Winner", "FillPrice", "Check", "Dealers [status @price]", "LoadedAt", "Source", _
+                       "Time", "OTC", "Cohort", "CohortAsked", "Link")
 End Function
 
 Public Function QuoteHeader() As Variant
-    QuoteHeader = Array("TradeDate", "Key", "Request", "Security", "ISIN", "Side", "Qty", "BrkrName", "Dealer", "Status", "Price", "Quoted", "Filled")
+    QuoteHeader = Array("TradeDate", "Key", "Request", "Security", "ISIN", "Side", "Qty", "BrkrName", "Dealer", "Status", "Price", "Quoted", "Filled", "Username", "PNT", "Time")
 End Function
 
 Public Function DailyHeader() As Variant
-    DailyHeader = Array("TradeDate", "Requests", "Filled", "Breach", "Low", "KeyIssues", "PctFilledCompliant", "AvgAsked", "UpdatedAt")
+    DailyHeader = Array("TradeDate", "Requests", "Filled", "Breach", "Low", "KeyIssues", "PctFilledCompliant", "AvgAsked", "UpdatedAt", "OtcReview", "Cohorts")
 End Function
 
 Public Sub EnsureHeader(ws As Worksheet, h As Variant)
@@ -2393,7 +2672,7 @@ Public Sub EnsureHeader(ws As Worksheet, h As Variant)
             ws.Columns("B").NumberFormat = "@": ws.Columns("B").ColumnWidth = 30
             ws.Columns("C").ColumnWidth = 26: ws.Columns("D").ColumnWidth = 14
             ws.Columns("N").ColumnWidth = 80: ws.Columns("O").NumberFormat = "yyyy-mm-dd hh:mm"
-            ws.Columns("O").ColumnWidth = 16: ws.Columns("P").ColumnWidth = 50
+            ws.Columns("O").ColumnWidth = 16: ws.Columns("P").ColumnWidth = 50: ws.Columns("S").ColumnWidth = 30: ws.Columns("U").ColumnWidth = 80
         ElseIf h(1) = "Requests" Then
             ws.Columns("G").NumberFormat = "0.0%": ws.Columns("H").NumberFormat = "0.0"
             ws.Columns("I").NumberFormat = "yyyy-mm-dd hh:mm": ws.Columns("B:I").ColumnWidth = 12
@@ -2434,6 +2713,7 @@ Private Sub WriteSheetTable(ws As Worksheet, h As Variant, data As Variant, ByVa
     ws.Range("A1").Resize(1, nc).EntireColumn.AutoFit
     If nc = UCOLS Then
         ws.Columns(14).ColumnWidth = 80: ws.Columns(15).NumberFormat = "yyyy-mm-dd hh:mm": ws.Columns(16).ColumnWidth = 50
+        ws.Columns(19).ColumnWidth = 30: ws.Columns(21).ColumnWidth = 80
     End If
 End Sub
 
@@ -2480,23 +2760,27 @@ Public Sub RecalcHistDaily(wsH As Worksheet, wsD As Worksheet, dates As Object)
     EnsureHeader wsD, DailyHeader()
     lastR = wsH.Cells(wsH.Rows.Count, 1).End(xlUp).Row
     If lastR < 2 Then Exit Sub
-    hv = wsH.Range("A1:M" & lastR).Value2
+    hv = wsH.Range("A1:U" & lastR).Value2
     Set agg = NewDict()
     For i = 2 To UBound(hv, 1)
         If VarType(hv(i, 1)) = vbDouble Then
             dk = CLng(Int(hv(i, 1)))
             If dates.Exists(dk) Then
-                If Not agg.Exists(dk) Then agg(dk) = Array(0#, 0#, 0#, 0#, 0#, 0#, 0#)  ' n, filled, breach, low, key, sumAsked, filledOK
+                If Not agg.Exists(dk) Then agg(dk) = Array(0#, 0#, 0#, 0#, 0#, 0#, 0#, 0#, 0#)  ' n, filled, breach, low, key, sumAsked, filledOK, otcReview, cohorts
                 a = agg(dk)
                 ck = CStr(hv(i, 13))
                 a(0) = a(0) + 1
                 If CStr(hv(i, 10)) = "YES" Then
                     a(1) = a(1) + 1
-                    If ck = "OK" Then a(6) = a(6) + 1
+                    If ck = "OK" Or ck = "OK-LINKED" Then a(6) = a(6) + 1
                 End If
                 If ck = "BREACH" Then a(2) = a(2) + 1
                 If ck = "LOW" Then a(3) = a(3) + 1
                 If ck = "KEY?" Then a(4) = a(4) + 1
+                If ck = "OTC-REVIEW" Then a(7) = a(7) + 1
+                If UBound(hv, 2) >= 19 Then
+                    If Len(CStr(hv(i, 19))) > 0 And CStr(hv(i, 19)) = CStr(hv(i, 2)) Then a(8) = a(8) + 1   ' fill heading a cohort
+                End If
                 a(5) = a(5) + Val(CStr(hv(i, 8)))
                 agg(dk) = a
             End If
@@ -2518,9 +2802,9 @@ Public Sub RecalcHistDaily(wsH As Worksheet, wsD As Worksheet, dates As Object)
             lastD = lastD + 1: rw = lastD: rowOf(k) = rw
         End If
         If a(1) > 0 Then pct = a(6) / a(1) Else pct = ""
-        wsD.Cells(rw, 1).Resize(1, 9).Value = Array(CDate(k), a(0), a(1), a(2), a(3), a(4), pct, a(5) / a(0), Now)
+        wsD.Cells(rw, 1).Resize(1, 11).Value = Array(CDate(k), a(0), a(1), a(2), a(3), a(4), pct, a(5) / a(0), Now, a(7), a(8))
     Next
-    If lastD > 2 Then wsD.Range("A1").Resize(lastD, 9).Sort Key1:=wsD.Range("A1"), Order1:=xlAscending, Header:=xlYes
+    If lastD > 2 Then wsD.Range("A1").Resize(lastD, 11).Sort Key1:=wsD.Range("A1"), Order1:=xlAscending, Header:=xlYes
 End Sub
 
 Private Function HistDailyMaxDate() As Double
@@ -2546,14 +2830,14 @@ End Function
 Private Sub BuildDashboard(out As Variant, ByVal m As Long, ByVal res As Object, ByVal info As String)
     Dim ws As Worksheet, i As Long, r As Long, q As Long, mx As Long, nFill As Long, nOkFill As Long
     Dim dist() As Long, hd As Worksheet, lr As Long, hv As Variant, rr As Long, c As Long, tbl() As Variant
-    Dim t0 As Date, t1 As Date, unitWord As String
+    Dim t0 As Date, t1 As Date, unitWord As String, ck As String, nc As Long, a As Long
 
     Set ws = GetSheet(SH_DASH)
     ws.Cells.Clear
     On Error Resume Next: ws.Cells.FormatConditions.Delete: On Error GoTo 0
     AddSheetButtons ws, DashButtons()
     ws.Columns("A").ColumnWidth = 2
-    ws.Range("B3").Value = "BLOT Best Execution  |  every quote request must ask at least " & MIN_Q & " counterparties (Banco de Portugal)"
+    ws.Range("B3").Value = "BLOT Best Execution  |  every executed trade must have asked at least " & MIN_Q & " counterparties (Banco de Portugal)"
     ws.Range("B3").Font.Size = 15: ws.Range("B3").Font.Bold = True: ws.Range("B3").Font.Color = RGB(31, 56, 100)
     ws.Range("B4").Value = "'" & info
     ws.Range("B4").Font.Italic = True: ws.Range("B4").Font.Color = RGB(89, 89, 89)
@@ -2566,50 +2850,69 @@ Private Sub BuildDashboard(out As Variant, ByVal m As Long, ByVal res As Object,
 
     '--- KPIs ---
     For i = 1 To m
+        ck = out(i, 13)
         If out(i, 10) = "YES" Then
             nFill = nFill + 1
-            If out(i, 13) = "OK" Then nOkFill = nOkFill + 1
+            If ck = "OK" Or ck = "OK-LINKED" Then nOkFill = nOkFill + 1
         End If
-        If out(i, 8) > mx Then mx = out(i, 8)
+        If ck <> "LINKED" Then
+            If Len(CStr(out(i, 20))) > 0 Then a = CLng(out(i, 20)) Else a = CLng(out(i, 8))
+            If a > mx Then mx = a
+        End If
         If t0 = 0 Or out(i, 1) < t0 Then t0 = out(i, 1)
         If out(i, 1) > t1 Then t1 = out(i, 1)
     Next
-    ws.Range("B6:B14").Value = Application.Transpose(Array("Trade date", unitWord, "Filled", "Not filled", _
-        "BREACH: filled with < " & MIN_Q & " asked", "LOW: not filled, < " & MIN_Q & " asked", _
-        "Requests with < " & MIN_Q & " dealers quoting", "KEY?: ambiguous grouping", "% filled trades compliant"))
+    ws.Range("B6:B17").Value = Application.Transpose(Array("Trade date", unitWord, "Filled (executions)", "Not filled", _
+        "BREACH: filled with < " & MIN_Q & " asked (cohort)", "OTC-REVIEW: OTC fill not joined", _
+        "LOW: not filled, < " & MIN_Q & " asked", "KEY?: ambiguous grouping", "Cohorts joined (later fill / OTC re-offer)", _
+        "Requests with < " & MIN_Q & " dealers quoting", "Rows excluded (" & IIf(Len(EXCLUDE_USERS) > 0, EXCLUDE_USERS, "none") & ")", _
+        "% executions compliant"))
     ws.Range("C6").Value = "'" & DateRangeText(t0, t1)
     ws.Range("C7").Value = m
     ws.Range("C8").Value = nFill
     ws.Range("C9").Value = m - nFill
     ws.Range("C10").Value = res("nBreach")
-    ws.Range("C11").Value = res("nLow")
-    ws.Range("C12").Value = res("nQuotedLow")
+    ws.Range("C11").Value = res("nOtcReview")
+    ws.Range("C12").Value = res("nLow")
     ws.Range("C13").Value = res("nKey")
-    If nFill > 0 Then ws.Range("C14").Value = nOkFill / nFill Else ws.Range("C14").Value = "'-"
-    ws.Range("C14").NumberFormat = "0.0%"
-    ws.Range("B6:C14").Borders.Color = RGB(217, 217, 217)
-    ws.Range("C6:C14").HorizontalAlignment = xlRight: ws.Range("C6:C14").Font.Bold = True
+    ws.Range("C14").Value = res("nLinked")
+    ws.Range("C15").Value = res("nQuotedLow")
+    ws.Range("C16").Value = res("nExcluded")
+    If nFill > 0 Then ws.Range("C17").Value = nOkFill / nFill Else ws.Range("C17").Value = "'-"
+    ws.Range("C17").NumberFormat = "0.0%"
+    ws.Range("B6:C17").Borders.Color = RGB(217, 217, 217)
+    ws.Range("C6:C17").HorizontalAlignment = xlRight: ws.Range("C6:C17").Font.Bold = True
     If res("nBreach") > 0 Then ws.Range("B10:C10").Interior.Color = RGB(255, 199, 206)
+    If res("nOtcReview") > 0 Then ws.Range("B11:C11").Interior.Color = RGB(255, 199, 206)
     If res("nKey") > 0 Then ws.Range("B13:C13").Interior.Color = RGB(255, 235, 156)
+    If res("nLinked") > 0 Then ws.Range("B14:C14").Interior.Color = RGB(221, 235, 247)
 
-    With ws.Range("B16:C16")
+    With ws.Range("B19:C19")
         .Merge
-        If res("nBreach") > 0 Or res("nKey") > 0 Then
-            .Value = "ALERT: " & res("nBreach") & " filled trade(s) with fewer than " & MIN_Q & " counterparties asked" & IIf(res("nKey") > 0, ", " & res("nKey") & " KEY?", "")
+        If res("nBreach") > 0 Or res("nOtcReview") > 0 Or res("nKey") > 0 Then
+            .Value = "ALERT: " & res("nBreach") & " BREACH, " & res("nOtcReview") & " OTC-REVIEW, " & res("nKey") & " KEY?"
             .Interior.Color = RGB(192, 0, 0)
         Else
-            .Value = "OK: every filled trade asked at least " & MIN_Q & " counterparties"
+            .Value = "OK: every execution asked at least " & MIN_Q & " counterparties (cohorts included)"
             .Interior.Color = RGB(0, 128, 0)
         End If
         .Font.Color = vbWhite: .Font.Bold = True: .HorizontalAlignment = xlCenter
     End With
+    If Len(res("missingCols")) > 0 Then
+        With ws.Range("B20:C20")
+            .Merge
+            .Value = "MISSING COLUMNS in the BLOT export: " & res("missingCols") & " (add them to the BLOT view or fill COLUMNS_SEQ)"
+            .Interior.Color = RGB(255, 192, 0): .Font.Bold = True: .WrapText = True
+        End With
+        ws.Rows(20).RowHeight = 30
+    End If
 
     '--- rule / legend ---
     ws.Range("E6").Value = "How the check works": ws.Range("E6").Font.Bold = True
-    ws.Range("E7").Value = "'One quote request = the dealer rows whose ID differs only in the last " & ID_SUFFIX_LEN & " characters (FITDNA:6AF5A884011800|03, |05, |06)."
-    ws.Range("E8").Value = "'Asked = distinct dealers on the request, whatever their status (Rejected, C/Cancel and Passed dealers were asked)."
-    ws.Range("E9").Value = "'Quoted = dealers whose row has a price.  Filled = a row whose status matches FILL_STATUS (" & FILL_STATUS & ")."
-    ws.Range("E10").Value = "'BREACH = filled with < " & MIN_Q & " asked.  LOW = not filled with < " & MIN_Q & " asked.  KEY? = one ID with two ISINs / sides / dates."
+    ws.Range("E7").Value = "'Request = dealer rows whose ID differs only in the last " & ID_SUFFIX_LEN & " characters. Asked = distinct dealers (all statuses). Quoted = dealers with a price."
+    ws.Range("E8").Value = "'Cohort = a fill + the earlier UNFILLED requests of the same day, ISIN and side: same quantity (later fill), or OTC (PNT) at the re-offer price on the issue date."
+    ws.Range("E9").Value = "'BREACH = fill (cohort) with < " & MIN_Q & " asked.  OTC-REVIEW = OTC fill that cannot be joined.  LOW = request not filled, < " & MIN_Q & " asked.  LINKED = request joined to a later fill."
+    ws.Range("E10").Value = "'Rows of " & IIf(Len(EXCLUDE_USERS) > 0, EXCLUDE_USERS, "(nobody)") & " (Username) are left out of the analysis.   Filled = status in FILL_STATUS or PNT = TRUE."
     ws.Range("E11").Value = "'Statuses seen in this export: " & res("statuses")
     ws.Range("E11").Font.Color = RGB(31, 56, 100): ws.Range("E11").Font.Bold = True
     If Len(res("warnings")) > 0 Then
@@ -2618,10 +2921,15 @@ Private Sub BuildDashboard(out As Variant, ByVal m As Long, ByVal res As Object,
     End If
     ws.Range("E7:E12").Font.Size = 9
 
-    '--- distribution of dealers asked ---
+    '--- distribution of dealers asked (per execution / standalone request) ---
     ReDim dist(0 To mx)
-    For i = 1 To m: dist(out(i, 8)) = dist(out(i, 8)) + 1: Next
-    ws.Range("E14").Value = "Dealers asked": ws.Range("F14").Value = unitWord
+    For i = 1 To m
+        If out(i, 13) <> "LINKED" Then
+            If Len(CStr(out(i, 20))) > 0 Then a = CLng(out(i, 20)) Else a = CLng(out(i, 8))
+            dist(a) = dist(a) + 1
+        End If
+    Next
+    ws.Range("E14").Value = "Dealers asked": ws.Range("F14").Value = "Count"
     Hdr ws.Range("E14:F14")
     For q = 0 To mx
         ws.Cells(15 + q, 5).Value = q: ws.Cells(15 + q, 6).Value = dist(q)
@@ -2632,54 +2940,63 @@ Private Sub BuildDashboard(out As Variant, ByVal m As Long, ByVal res As Object,
     '--- recent days ---
     Set hd = GetSheet(SH_HD)
     lr = hd.Cells(hd.Rows.Count, 1).End(xlUp).Row
-    ws.Range("I14:N14").Value = Array("Recent days", "Requests", "Filled", "Breach", "Low", "KEY?")
+    ws.Range("I14:N14").Value = Array("Recent days", "Requests", "Filled", "Breach", "OTC review", "KEY?")
     Hdr ws.Range("I14:N14")
     rr = 14
     If lr >= 2 Then
         For i = lr To Application.WorksheetFunction.Max(2, lr - 7) Step -1
-            hv = hd.Range(hd.Cells(i, 1), hd.Cells(i, 6)).Value
+            hv = hd.Range(hd.Cells(i, 1), hd.Cells(i, 11)).Value
             rr = rr + 1
-            For c = 1 To 6: ws.Cells(rr, 8 + c).Value = hv(1, c): Next
-            ws.Cells(rr, 9).NumberFormat = "yyyy-mm-dd"
-            If Val(CStr(hv(1, 4))) > 0 Then ws.Range(ws.Cells(rr, 9), ws.Cells(rr, 14)).Interior.Color = RGB(255, 199, 206)
+            ws.Cells(rr, 9).Value = hv(1, 1): ws.Cells(rr, 9).NumberFormat = "yyyy-mm-dd"
+            ws.Cells(rr, 10).Value = hv(1, 2): ws.Cells(rr, 11).Value = hv(1, 3): ws.Cells(rr, 12).Value = hv(1, 4)
+            ws.Cells(rr, 13).Value = hv(1, 10): ws.Cells(rr, 14).Value = hv(1, 6)
+            If Val(CStr(hv(1, 4))) + Val(CStr(hv(1, 10))) > 0 Then ws.Range(ws.Cells(rr, 9), ws.Cells(rr, 14)).Interior.Color = RGB(255, 199, 206)
         Next
     End If
 
-    '--- requests table ---
-    r = Application.WorksheetFunction.Max(18, 16 + mx, rr) + 2
-    ws.Cells(r, 2).Value = unitWord & " (worst first)": ws.Cells(r, 2).Font.Bold = True: ws.Cells(r, 2).Font.Size = 12
+    '--- requests / cohorts table ---
+    r = Application.WorksheetFunction.Max(22, 16 + mx, rr) + 2
+    ws.Cells(r, 2).Value = unitWord & " and cohorts (worst first; joined requests under their fill)": ws.Cells(r, 2).Font.Bold = True: ws.Cells(r, 2).Font.Size = 12
     r = r + 1
-    ws.Cells(r, 2).Resize(1, 12).Value = Array("Trade date", "Security", "ISIN", "Side", "Qty", "Asked", "Quoted", "Filled", "Winner", "Price", "Check", "Dealers [status @price]")
-    Hdr ws.Cells(r, 2).Resize(1, 12)
-    ReDim tbl(1 To m, 1 To 12)
+    nc = 16
+    ws.Cells(r, 2).Resize(1, nc).Value = Array("Trade date", "Time", "Security", "ISIN", "Side", "Qty", "Asked", "Cohort asked", _
+                                               "Quoted", "Filled", "OTC", "Winner", "Price", "Check", "Cohort / link", "Dealers [status @price]")
+    Hdr ws.Cells(r, 2).Resize(1, nc)
+    ReDim tbl(1 To m, 1 To nc)
     For i = 1 To m
-        tbl(i, 1) = out(i, 1): tbl(i, 2) = "'" & out(i, 3): tbl(i, 3) = "'" & out(i, 4): tbl(i, 4) = "'" & out(i, 5)
-        tbl(i, 5) = out(i, 6): tbl(i, 6) = out(i, 8): tbl(i, 7) = out(i, 9): tbl(i, 8) = out(i, 10)
-        tbl(i, 9) = "'" & out(i, 11): tbl(i, 10) = out(i, 12): tbl(i, 11) = out(i, 13): tbl(i, 12) = "'" & out(i, 14)
+        tbl(i, 1) = out(i, 1): tbl(i, 2) = "'" & out(i, 17)
+        tbl(i, 3) = "'" & IIf(out(i, 13) = "LINKED", "   > ", "") & out(i, 3)
+        tbl(i, 4) = "'" & out(i, 4): tbl(i, 5) = "'" & out(i, 5): tbl(i, 6) = out(i, 6)
+        tbl(i, 7) = out(i, 8): tbl(i, 8) = out(i, 20): tbl(i, 9) = out(i, 9): tbl(i, 10) = out(i, 10)
+        tbl(i, 11) = out(i, 18): tbl(i, 12) = "'" & out(i, 11): tbl(i, 13) = out(i, 12): tbl(i, 14) = out(i, 13)
+        tbl(i, 15) = "'" & out(i, 21): tbl(i, 16) = "'" & out(i, 14)
     Next
-    ws.Cells(r + 1, 2).Resize(m, 12).Value = tbl
+    ws.Cells(r + 1, 2).Resize(m, nc).Value = tbl
     ws.Cells(r + 1, 2).Resize(m, 1).NumberFormat = "yyyy-mm-dd"
     For i = 1 To m
         rr = r + i
         Select Case out(i, 13)
-            Case "BREACH"
-                ws.Cells(rr, 2).Resize(1, 12).Interior.Color = RGB(255, 199, 206): ws.Cells(rr, 12).Font.Bold = True
+            Case "BREACH", "OTC-REVIEW"
+                ws.Cells(rr, 2).Resize(1, nc).Interior.Color = RGB(255, 199, 206): ws.Cells(rr, 15).Font.Bold = True
             Case "KEY?"
-                ws.Cells(rr, 2).Resize(1, 12).Interior.Color = RGB(255, 235, 156)
+                ws.Cells(rr, 2).Resize(1, nc).Interior.Color = RGB(255, 235, 156)
             Case "LOW"
-                ws.Cells(rr, 12).Interior.Color = RGB(255, 235, 156)
+                ws.Cells(rr, 15).Interior.Color = RGB(255, 235, 156)
+            Case "OK-LINKED"
+                ws.Cells(rr, 2).Resize(1, nc).Interior.Color = RGB(221, 235, 247): ws.Cells(rr, 15).Interior.Color = RGB(198, 239, 206)
+            Case "LINKED"
+                ws.Cells(rr, 2).Resize(1, nc).Interior.Color = RGB(242, 247, 252): ws.Cells(rr, 2).Resize(1, nc).Font.Italic = True
             Case "OK"
-                ws.Cells(rr, 12).Interior.Color = RGB(198, 239, 206)
+                ws.Cells(rr, 15).Interior.Color = RGB(198, 239, 206)
         End Select
-        If out(i, 9) < MIN_Q Then ws.Cells(rr, 8).Font.Color = RGB(192, 80, 0): ws.Cells(rr, 8).Font.Bold = True
-        If out(i, 10) = "YES" Then ws.Cells(rr, 9).Font.Bold = True
+        If out(i, 10) = "YES" Then ws.Cells(rr, 11).Font.Bold = True
     Next
-    ws.Cells(r, 2).Resize(m + 1, 12).Borders.Color = RGB(217, 217, 217)
+    ws.Cells(r, 2).Resize(m + 1, nc).Borders.Color = RGB(217, 217, 217)
 
-    ws.Columns("B").ColumnWidth = 36: ws.Columns("C").ColumnWidth = 26: ws.Columns("D").ColumnWidth = 14
-    ws.Columns("E").ColumnWidth = 13: ws.Columns("F:I").ColumnWidth = 10: ws.Columns("J").ColumnWidth = 22
-    ws.Columns("K").ColumnWidth = 10: ws.Columns("L").ColumnWidth = 9: ws.Columns("M").ColumnWidth = 110
-    ws.Columns("N").ColumnWidth = 8
+    ws.Columns("B").ColumnWidth = 40: ws.Columns("C").ColumnWidth = 30: ws.Columns("D").ColumnWidth = 14
+    ws.Columns("E").ColumnWidth = 14: ws.Columns("F:I").ColumnWidth = 10: ws.Columns("J:L").ColumnWidth = 9
+    ws.Columns("M").ColumnWidth = 18: ws.Columns("N").ColumnWidth = 9: ws.Columns("O").ColumnWidth = 11
+    ws.Columns("P").ColumnWidth = 70: ws.Columns("Q").ColumnWidth = 90
 End Sub
 
 '==========================================================================================

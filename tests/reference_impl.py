@@ -1,4 +1,4 @@
-"""Independent pandas re-implementation of the v5 BLOT best-execution rule.
+"""Independent pandas re-implementation of the v6 BLOT best-execution rule.
 
 One BLOT row = one dealer leg of a quote request.
   request  = rows whose ID is equal except the last ID_SUFFIX_LEN characters (no ID: date|ISIN|side|qty)
@@ -6,8 +6,11 @@ One BLOT row = one dealer leg of a quote request.
   asked    = distinct dealers (DEALER_MAP applied), whatever their status
   quoted   = distinct dealers whose row has a price > 0
   filled   = a row whose status contains a FILL_STATUS token
-  check    = KEY? (request with two ISINs / sides / dates) | BREACH (filled, asked < MIN_Q)
-             | LOW (not filled, asked < MIN_Q) | OK
+  excluded = rows of EXCLUDE_USERS (Username), left out first
+  cohort   = a fill + the earlier unfilled requests of the same day / ISIN / side: same quantity (later fill),
+             or, for an OTC fill (PNT), trade date = issue date and price = re-offer price (any quantity)
+  check    = KEY? | OTC-REVIEW (OTC fill not joined) | BREACH (fill, cohort asked < MIN_Q)
+             | OK-LINKED | LINKED (request joined to a fill) | LOW (not filled, asked < MIN_Q) | OK
 
     python tests/reference_impl.py                          # reference vs expected
     python tests/reference_impl.py --vba-dir tests/vba_out  # + reference vs VBA, unit by unit
@@ -20,6 +23,7 @@ import io
 import json
 import re
 import sys
+import unicodedata
 from datetime import date
 from pathlib import Path
 
@@ -32,9 +36,14 @@ DEFAULTS = {
     "HDR_DEALER": "brkrname|broker name|broker|dealer|counterparty", "HDR_ID": "id|ticket id|trade id",
     "HDR_SECURITY": "security|description", "HDR_ISIN": "isin", "HDR_SIDE": "side|b/s", "HDR_STATUS": "status",
     "HDR_QTY": "qty (m)|qty|quantity", "HDR_PRICE": "price", "HDR_DATE": "trade dt|trade date",
+    "HDR_USER": "username|user name|user", "HDR_PNT": "pnt", "HDR_ISSUE_DATE": "issue date|issue dt|iss date|iss dt",
+    "HDR_REOFFER": "reoffer price|re-offer price|reoffer px|re-offer px|reoffer|re-offer",
+    "HDR_TIME": "time|trade time|exec time|execution time|inquiry time|create time",
+    "EXCLUDE_USERS": "ROGERIO SANTOS", "LINK_LATER_FILLS": "TRUE", "PX_TOL": "0.0001",
 }
 ROLES = {"dl": "HDR_DEALER", "id": "HDR_ID", "sec": "HDR_SECURITY", "isin": "HDR_ISIN", "side": "HDR_SIDE",
-         "st": "HDR_STATUS", "qty": "HDR_QTY", "px": "HDR_PRICE", "dt": "HDR_DATE"}
+         "st": "HDR_STATUS", "qty": "HDR_QTY", "px": "HDR_PRICE", "dt": "HDR_DATE", "user": "HDR_USER",
+         "pnt": "HDR_PNT", "iss": "HDR_ISSUE_DATE", "reo": "HDR_REOFFER", "time": "HDR_TIME"}
 
 
 def norm_name(s: str) -> str:
@@ -74,7 +83,7 @@ def find_block(rows, cfg):
     for r, row in enumerate(rows[:40]):
         last = max((j + 1 for j, v in enumerate(row) if v.strip(" ")), default=0)
         h = row[:last]
-        if last >= 3 and header_index(h, cfg["HDR_DEALER"]) and (header_index(h, cfg["HDR_ID"]) or header_index(h, cfg["HDR_ISIN"])):
+        if last >= 3 and header_index(h, cfg["HDR_DEALER"]) and header_index(h, cfg["HDR_ID"]) and header_index(h, cfg["HDR_STATUS"]):
             return [x[:last] for x in rows[r:]]
     return None
 
@@ -107,65 +116,171 @@ def price(s: str) -> float:
     return float(s) if re.fullmatch(r"-?\d+(\.\d+)?", s) else 0.0
 
 
+FILL_KILL = ("cancel", "reject")
+TRUTHY = {"TRUE", "Y", "YES", "1", "X", "SIM", "S", "VERDADEIRO", "-1"}
+EPOCH = date(1899, 12, 30)
+
+
+def serial(d: date) -> float:
+    return float((d - EPOCH).days)
+
+
+def norm_user(s: str) -> str:
+    s = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+    return norm_name(s)
+
+
+def id_time(id_: str, d: date) -> float:
+    """Unix seconds in the first 8 hex digits after the last ':' of a Bloomberg request ID (kept if within a day)."""
+    hx = id_.strip().rsplit(":", 1)[-1][:8].upper()
+    if len(hx) < 8 or any(c not in "0123456789ABCDEF" for c in hx):
+        return 0.0
+    t = 25569.0 + int(hx, 16) / 86400.0
+    return t if abs(int(t) - serial(d)) <= 1 else 0.0
+
+
+def time_of(s: str, d: date) -> float:
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", s.strip())
+    if m:
+        h, mi, se = int(m[1]), int(m[2]), int(m[3] or 0)
+        if h <= 23 and mi <= 59 and se <= 59:
+            return serial(d) + (h * 3600 + mi * 60 + se) / 86400.0
+    return 0.0
+
+
 def analyse(block, cfg, dmap, default_td):
     hdr = block[0]
     col = {k: header_index(hdr, cfg[v]) for k, v in ROLES.items()}
-    df = pd.DataFrame(block[1:], columns=range(1, len(hdr) + 1)).astype(str).apply(lambda c: c.str.strip(" "))
-    g = lambda k: df[col[k]] if col[k] else pd.Series([""] * len(df), index=df.index)
-    df = pd.DataFrame({k: g(k) for k in col})
-    df = df[df["dl"] != ""].copy()
-    n_suffix = int(cfg["ID_SUFFIX_LEN"])
-    min_q = int(cfg["MIN_Q"])
+    min_q, n_suffix = int(cfg["MIN_Q"]), int(cfg["ID_SUFFIX_LEN"])
     fills = [t.strip() for t in cfg["FILL_STATUS"].lower().split("|") if t.strip()]
+    excl = {norm_user(x) for x in cfg["EXCLUDE_USERS"].replace(";", "|").split("|") if norm_user(x)}
+    tol = float(cfg["PX_TOL"].replace(",", "."))
+    link_later = cfg["LINK_LATER_FILLS"].upper() in ("TRUE", "1", "YES", "VERDADEIRO", "SIM")
+    df = pd.DataFrame(block[1:], columns=range(1, len(hdr) + 1)).astype(str).apply(lambda c: c.str.strip(" "))
+    get = lambda r, k: r[col[k]] if col[k] else ""
+    missing = (["PNT"] if not col["pnt"] else []) + (["Username"] if not col["user"] and excl else [])
 
-    df["d"] = df["dt"].map(lambda s: parse_date(s, cfg["DATE_FORMAT_TEXT"]) or default_td)
-    df["isinU"] = df["isin"].str.upper()
-    df["bond"] = df["isinU"].where(df["isinU"] != "", df["sec"].str.upper())
-    df["sideU"] = df["side"].str.upper()
-
-    def req_key(r):
-        if r["id"]:
-            return "INQ:" + (r["id"][:-n_suffix] if len(r["id"]) > n_suffix + 3 and n_suffix else r["id"])
-        return f"CMP:{r['d'].isoformat()}|{r['bond']}|{r['sideU']}|{r['qty']}"
-    df["req"] = df.apply(req_key, axis=1)
-    bad_req = set()
-    for k, gg in df.groupby("req"):
-        for c in ("isinU", "sideU"):
-            if gg[c][gg[c] != ""].nunique() > 1:
-                bad_req.add(k)
-        if gg["d"].nunique() > 1:
-            bad_req.add(k)
-    if cfg["GROUP_LEVEL"].upper() == "ORDER":
-        df["unit"] = "ORD:" + df["d"].map(date.isoformat) + "|" + df["bond"] + "|" + df["sideU"]
-    else:
-        df["unit"] = df["req"]
-    df["dealer"] = df["dl"].map(norm_name).map(lambda n: dmap.get(n, n))
-    df["quoted"] = df["px"].map(price) > 0
-    df["filled"] = df["st"].str.lower().map(lambda s: bool(s) and any(t in s for t in fills))
-
-    units = []
-    for k, gg in df.groupby("unit", sort=False):
-        asked = gg["dealer"].nunique()
-        filled = bool(gg["filled"].any())
-        winners = list(dict.fromkeys(gg.loc[gg["filled"], "dealer"]))
-        if set(gg["req"]) & bad_req:
-            check = "KEY?"
-        elif asked < min_q:
-            check = "BREACH" if filled else "LOW"
+    units, order, reqs, bad = {}, [], set(), set()
+    seen_isin, seen_side, seen_date = {}, {}, {}
+    n_excl = n_legs = 0
+    for _, r in df.iterrows():
+        if col["user"] and excl and norm_user(get(r, "user")) in excl:
+            n_excl += 1
+            continue
+        dealer = get(r, "dl")
+        if not dealer:
+            continue
+        d = parse_date(get(r, "dt"), cfg["DATE_FORMAT_TEXT"]) or default_td
+        isin, sec, side, qty, rid = get(r, "isin").upper(), get(r, "sec"), get(r, "side").upper(), get(r, "qty"), get(r, "id")
+        bond = isin or sec.upper()
+        if rid:
+            req = "INQ:" + (rid[:-n_suffix] if len(rid) > n_suffix + 3 and n_suffix else rid)
         else:
-            check = "OK"
-        units.append({"key": k, "date": gg["d"].iloc[0].isoformat(), "requests": gg["req"].nunique(), "asked": asked,
-                      "quoted": gg.loc[gg["quoted"], "dealer"].nunique(), "filled": "YES" if filled else "NO",
-                      "winner": ";".join(winners), "check": check})
-    return {"units": units, "n_units": len(units), "n_requests": df["req"].nunique(), "n_legs": len(df),
-            "n_filled": sum(u["filled"] == "YES" for u in units), "n_breach": sum(u["check"] == "BREACH" for u in units),
-            "n_low": sum(u["check"] == "LOW" for u in units), "n_key": sum(u["check"] == "KEY?" for u in units),
-            "n_quoted_low": sum(u["quoted"] < min_q for u in units)}
+            req = f"CMP:{d.isoformat()}|{bond}|{side}|{qty}"
+        reqs.add(req)
+        for store, val in ((seen_isin, isin), (seen_side, side), (seen_date, d.isoformat())):
+            if val:
+                if req not in store:
+                    store[req] = val
+                elif store[req] != val:
+                    bad.add(req)
+        key = f"ORD:{d.isoformat()}|{bond}|{side}" if cfg["GROUP_LEVEL"].upper() == "ORDER" else req
+        if key not in units:
+            units[key] = {"key": key, "date": d, "bond": bond, "side": side, "qn": price(qty), "reqs": set(),
+                          "asked": set(), "quoted": set(), "filled": False, "winners": [], "px": None,
+                          "t": 0.0, "otc": False, "iss": None, "reo": 0.0}
+            order.append(key)
+        u = units[key]
+        u["reqs"].add(req)
+        t = time_of(get(r, "time"), d) if col["time"] else 0.0
+        if not t and col["id"]:
+            t = id_time(rid, d)
+        if t and (not u["t"] or t < u["t"]):
+            u["t"] = t
+        if col["iss"] and u["iss"] is None:
+            u["iss"] = parse_date(get(r, "iss"), cfg["DATE_FORMAT_TEXT"])
+        if col["reo"] and not u["reo"]:
+            u["reo"] = price(get(r, "reo"))
+        name = norm_name(dealer)
+        name = dmap.get(name, name)
+        st = get(r, "st")
+        px = price(get(r, "px")) if col["px"] else 0.0
+        pnt = bool(col["pnt"]) and get(r, "pnt").strip().upper() in TRUTHY
+        filled = (bool(st) and any(t_ in st.lower() for t_ in fills)) or (pnt and not any(k in st.lower() for k in FILL_KILL))
+        u["asked"].add(name)
+        if px > 0:
+            u["quoted"].add(name)
+        if filled:
+            u["filled"] = True
+            u["otc"] = u["otc"] or pnt
+            if name not in u["winners"]:
+                u["winners"].append(name)
+            if u["px"] is None and px > 0:
+                u["px"] = px
+        n_legs += 1
+
+    # fills processed in time order (stable insertion sort; an unknown time is never "after")
+    idx = list(order)
+    for i in range(1, len(idx)):
+        t, j = idx[i], i - 1
+        while j >= 0 and units[idx[j]]["t"] and units[t]["t"] and units[idx[j]]["t"] > units[t]["t"]:
+            idx[j + 1] = idx[j]
+            j -= 1
+        idx[j + 1] = t
+    head, cohort_asked, check = {}, {}, {}
+    for k in idx:
+        f = units[k]
+        if not f["filled"] or f["reqs"] & bad:
+            continue
+        cands = [c for c in order if c != k and not units[c]["filled"] and not (units[c]["reqs"] & bad) and c not in head
+                 and units[c]["date"] == f["date"] and units[c]["bond"] == f["bond"] and units[c]["side"] == f["side"]
+                 and (not units[c]["t"] or not f["t"] or units[c]["t"] <= f["t"])]
+        sel = []
+        if f["otc"] and len(f["asked"]) < min_q:
+            ok = bool(col["iss"] and col["reo"]) and f["iss"] is not None and f["iss"] == f["date"] \
+                and f["reo"] > 0 and f["px"] is not None and abs(f["px"] - f["reo"]) <= tol
+            if ok and cands:
+                sel = cands
+            else:
+                check[k] = "OTC-REVIEW"
+        elif link_later:
+            sel = [c for c in cands if f["qn"] != 0 and abs(units[c]["qn"] - f["qn"]) < 1e-7]
+        if sel:
+            union = set(f["asked"])
+            for c in sel:
+                head[c] = k
+                union |= units[c]["asked"]
+            cohort_asked[k] = len(union)
+    out = []
+    for k in order:
+        u = units[k]
+        if u["reqs"] & bad:
+            c = "KEY?"
+        elif check.get(k) == "OTC-REVIEW":
+            c = "OTC-REVIEW"
+        elif k in head:
+            c = "LINKED"
+        elif u["filled"]:
+            n = cohort_asked.get(k, len(u["asked"]))
+            c = "BREACH" if n < min_q else ("OK-LINKED" if k in cohort_asked else "OK")
+        else:
+            c = "LOW" if len(u["asked"]) < min_q else "OK"
+        out.append({"key": k, "date": u["date"].isoformat(), "requests": len(u["reqs"]), "asked": len(u["asked"]),
+                    "quoted": len(u["quoted"]), "filled": "YES" if u["filled"] else "NO", "winner": ";".join(u["winners"]),
+                    "check": c, "cohort": k if k in cohort_asked else head.get(k, ""),
+                    "cohort_asked": cohort_asked.get(k, ""), "otc": "YES" if u["otc"] else ""})
+    return {"ok": True, "units": out, "n_units": len(out), "n_requests": len(reqs), "n_legs": n_legs,
+            "n_filled": sum(x["filled"] == "YES" for x in out), "n_breach": sum(x["check"] == "BREACH" for x in out),
+            "n_low": sum(x["check"] == "LOW" for x in out), "n_key": sum(x["check"] == "KEY?" for x in out),
+            "n_otc_review": sum(x["check"] == "OTC-REVIEW" for x in out), "n_linked": len(cohort_asked),
+            "n_excluded": n_excl, "missing_cols": ", ".join(missing),
+            "n_quoted_low": sum(x["quoted"] < min_q and x["check"] != "LINKED" for x in out)}
 
 
 def compare_expected(res, exp):
     errs = [f"{k}: expected {exp[k]}, got {res[k]}" for k in
-            ("n_units", "n_requests", "n_legs", "n_filled", "n_breach", "n_low", "n_key", "n_quoted_low")
+            ("n_units", "n_requests", "n_legs", "n_filled", "n_breach", "n_low", "n_key", "n_quoted_low",
+             "n_otc_review", "n_linked", "n_excluded", "missing_cols")
             if k in exp and res[k] != exp[k]]
     got = {u["key"]: u for u in res["units"]}
     if "units" in exp:

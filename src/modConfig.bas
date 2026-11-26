@@ -36,6 +36,8 @@ Public SILENCE_FORMAT_PROMPT As Boolean
 Public MIN_Q As Long, GROUP_LEVEL As String, FILL_STATUS As String, ID_SUFFIX_LEN As Long, DATE_FORMAT_TEXT As String
 Public HDR_DEALER As String, HDR_ID As String, HDR_SECURITY As String, HDR_ISIN As String, HDR_SIDE As String
 Public HDR_STATUS As String, HDR_QTY As String, HDR_PRICE As String, HDR_DATE As String
+Public HDR_USER As String, HDR_PNT As String, HDR_ISSUE_DATE As String, HDR_REOFFER As String, HDR_TIME As String
+Public EXCLUDE_USERS As String, LINK_LATER_FILLS As Boolean, PX_TOL As Double, COLUMNS_SEQ As String
 
 ' fixed (no longer on CONFIG)
 Public Const STEP_GAP_S As Double = 0.7
@@ -60,6 +62,7 @@ Private Sub BuildDefs()
     AddDef "BLOOMBERG", "OPEN_SEQ", "KEYS:BLOT 2<GO>|WAIT:3|KEYS:BLOT -1<GO>|WAIT:5", "Opens the BLOT of the previous day. KEYS:text<GO> | SEND:keys | WAIT:s. {DAYS_BACK} = days to the previous business day.", ""
     AddDef "BLOOMBERG", "EXPORT_SEQ", "KEYS:2<GO>|WAIT:2|KEYS:2<GO>|WAIT:3|KEYS:1<GO>|WAIT:5", _
            "Export through DDE: 2<GO> Export, 2<GO> 'XLS - Excel format', 1<GO> '1) Export' in the Export Blotter dialog.", ""
+    AddDef "BLOOMBERG", "COLUMNS_SEQ", "", "Steps that add the PNT and Username columns to the BLOT view. Run only when an export lacks them, then the export is repeated once. Empty = add them once by hand (Bloomberg keeps the view).", "U"
     AddDef "BLOOMBERG", "EXPORT_FOLDER", "", "Folder where every BLOT export is SAVED by the workbook (BLOT_<tradedate>_<timestamp>.xls*, regulatory evidence). Also watched for Bloomberg's own XLS.", "U"
     AddDef "BLOOMBERG", "TIMEOUT_S", "300", "Seconds to wait for the export before a TIMEOUT alert.", ""
     AddDef "BLOOMBERG", "POLL_S", "3", "Seconds between checks for the export.", ""
@@ -74,6 +77,9 @@ Private Sub BuildDefs()
     AddDef "RULE", "MIN_Q", "3", "Minimum counterparties ASKED per quote request (Banco de Portugal: 3).", ""
     AddDef "RULE", "GROUP_LEVEL", "INQUIRY", "INQUIRY = each quote request (ID without its last characters) | ORDER = all requests for the same ISIN, side and trade date counted together.", "U"
     AddDef "RULE", "FILL_STATUS", "done|filled|accepted|traded|executed|complete", "Status values ('|'-separated, substring) meaning the dealer row was EXECUTED. Check the 'Statuses seen' line on the DASHBOARD.", "U"
+    AddDef "RULE", "EXCLUDE_USERS", "ROGERIO SANTOS", "Username(s) whose trades are left out of the analysis ('|'-separated; case, accents and spaces ignored).", "U"
+    AddDef "RULE", "LINK_LATER_FILLS", "TRUE", "TRUE = a fill joins the earlier unfilled requests of the same day, ISIN, side and quantity (cohort; the 3-dealer check uses all their dealers).", ""
+    AddDef "RULE", "PX_TOL", "0.0001", "OTC fill joined to its requests only if |ticket price - re-offer price| <= PX_TOL (and trade date = issue date).", ""
     AddDef "RULE", "ID_SUFFIX_LEN", "2", "ID = request + dealer leg: the last N characters are the leg (FITDNA:6AF5A884011800|03).", ""
     AddDef "RULE", "DATE_FORMAT_TEXT", "DD/MM/YYYY", "Format of TEXT dates (real date cells are always read correctly).", ""
 
@@ -86,6 +92,11 @@ Private Sub BuildDefs()
     AddDef "HEADERS", "HDR_QTY", "qty (m)|qty|quantity", "Quantity.", ""
     AddDef "HEADERS", "HDR_PRICE", "price", "Price quoted by the dealer (non-empty = the dealer quoted).", ""
     AddDef "HEADERS", "HDR_DATE", "trade dt|trade date", "Trade date.", ""
+    AddDef "HEADERS", "HDR_USER", "username|user name|user", "Trader username (EXCLUDE_USERS).", ""
+    AddDef "HEADERS", "HDR_PNT", "pnt", "OTC flag: TRUE = executed OTC (add the PNT column to the BLOT view).", ""
+    AddDef "HEADERS", "HDR_ISSUE_DATE", "issue date|issue dt|iss date|iss dt", "Issue date of the bond (OTC rule: trade date = issue date).", ""
+    AddDef "HEADERS", "HDR_REOFFER", "reoffer price|re-offer price|reoffer px|re-offer px|reoffer|re-offer", "Re-offer price (OTC rule: ticket price = re-offer price).", ""
+    AddDef "HEADERS", "HDR_TIME", "time|trade time|exec time|execution time|inquiry time|create time", "Time of the request / fill (else the time in the ID is used).", ""
 End Sub
 
 Private Sub AddDef(ByVal sec As String, ByVal k As String, ByVal def As String, ByVal desc As String, ByVal flag As String)
@@ -145,6 +156,15 @@ Public Sub ApplyConfig(ByVal d As Object)
     HDR_QTY = LCase$(CfgStr(d, "HDR_QTY"))
     HDR_PRICE = LCase$(CfgStr(d, "HDR_PRICE"))
     HDR_DATE = LCase$(CfgStr(d, "HDR_DATE"))
+    HDR_USER = LCase$(CfgStr(d, "HDR_USER"))
+    HDR_PNT = LCase$(CfgStr(d, "HDR_PNT"))
+    HDR_ISSUE_DATE = LCase$(CfgStr(d, "HDR_ISSUE_DATE"))
+    HDR_REOFFER = LCase$(CfgStr(d, "HDR_REOFFER"))
+    HDR_TIME = LCase$(CfgStr(d, "HDR_TIME"))
+    EXCLUDE_USERS = CfgStr(d, "EXCLUDE_USERS")
+    LINK_LATER_FILLS = CfgBool(d, "LINK_LATER_FILLS")
+    PX_TOL = CfgNum(d, "PX_TOL")
+    COLUMNS_SEQ = CfgStr(d, "COLUMNS_SEQ")
     Set HolidaySet = LoadHolidays()
 End Sub
 
@@ -535,11 +555,20 @@ Public Function ValidateConfigCore(Optional ByRef nFail As Long, Optional ByRef 
     If Len(ALERT_TO) = 0 Then VAdd res, "ALERT_TO", "WARN", "No e-mail alerts." Else VAdd res, "ALERT_TO", "PASS", ALERT_TO
     If SHOW_POPUPS Then VAdd res, "SHOW_POPUPS", "WARN", "TRUE blocks unattended runs until dismissed." Else VAdd res, "SHOW_POPUPS", "PASS", "FALSE"
 
+    If Len(EXCLUDE_USERS) > 0 Then VAdd res, "EXCLUDE_USERS", "PASS", EXCLUDE_USERS & " (rows left out; needs the Username column)" Else VAdd res, "EXCLUDE_USERS", "PASS", "nobody excluded"
+    e = ValidateSteps(COLUMNS_SEQ)
+    If Len(e) > 0 Then
+        VAdd res, "COLUMNS_SEQ", "FAIL", e
+    ElseIf Len(COLUMNS_SEQ) = 0 Then
+        VAdd res, "COLUMNS_SEQ", "WARN", "Empty: the PNT and Username columns must be in the BLOT view (add them once; the dashboard shows MISSING COLUMNS otherwise)."
+    Else
+        VAdd res, "COLUMNS_SEQ", "PASS", COLUMNS_SEQ
+    End If
     If MIN_Q <> 3 Then VAdd res, "MIN_Q", "WARN", "Regulatory threshold is 3; now " & MIN_Q & "." Else VAdd res, "MIN_Q", "PASS", "3"
     If GROUP_LEVEL <> "INQUIRY" And GROUP_LEVEL <> "ORDER" Then
         VAdd res, "GROUP_LEVEL", "FAIL", "'" & GROUP_LEVEL & "' is not INQUIRY | ORDER."
     ElseIf GROUP_LEVEL = "ORDER" Then
-        VAdd res, "GROUP_LEVEL", "WARN", "ORDER: requests for the same ISIN/side/day are counted together (the export has no order id). Compliance decision."
+        VAdd res, "GROUP_LEVEL", "WARN", "ORDER merges every request of an ISIN/side/day; the cohort rule (later fill / OTC re-offer) is more precise at INQUIRY level."
     Else
         VAdd res, "GROUP_LEVEL", "PASS", "INQUIRY"
     End If

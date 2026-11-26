@@ -14,8 +14,8 @@
       "expect": {
         "n_units": 3,
         "n_filled": 2,
-        "n_breach": 1,
-        "n_low": 1,
+        "n_breach": 0,
+        "n_low": 0,
         "hist_rows": 3,
         "hist_daily_rows": 2,
         "units": [
@@ -27,7 +27,8 @@
             "quoted": 0,
             "filled": "NO",
             "winner": "",
-            "check": "LOW"
+            "check": "LINKED",
+            "cohort": "INQ:FITDNA:IIII00000002I0"
           },
           {
             "key": "INQ:FITDNA:IIII00000002I0",
@@ -37,7 +38,9 @@
             "quoted": 2,
             "filled": "YES",
             "winner": "DEALER THREE",
-            "check": "BREACH"
+            "check": "OK-LINKED",
+            "cohort": "INQ:FITDNA:IIII00000002I0",
+            "cohort_asked": 4
           },
           {
             "key": "INQ:FITDNA:JJJJ00000000J0",
@@ -49,7 +52,8 @@
             "winner": "DEALER ONE",
             "check": "OK"
           }
-        ]
+        ],
+        "n_linked": 1
       }
     },
     {

@@ -1,0 +1,360 @@
+{
+  "fixture": "b4_cohorts.csv",
+  "default_trade_date": "2026-11-12",
+  "dealer_map": {},
+  "cases": [
+    {
+      "name": "default",
+      "config": {},
+      "expect": {
+        "n_units": 12,
+        "n_legs": 23,
+        "n_filled": 6,
+        "n_breach": 2,
+        "n_otc_review": 1,
+        "n_low": 0,
+        "n_linked": 3,
+        "n_excluded": 2,
+        "missing_cols": "",
+        "first_check": "BREACH",
+        "units": [
+          {
+            "key": "INQ:FITDNA:6AF58E20000001",
+            "date": "2026-11-12",
+            "requests": 1,
+            "asked": 3,
+            "quoted": 2,
+            "filled": "NO",
+            "winner": "",
+            "check": "LINKED",
+            "cohort": "INQ:FITDNA:6AF59528000002",
+            "cohort_asked": "",
+            "otc": ""
+          },
+          {
+            "key": "INQ:FITDNA:6AF59528000002",
+            "date": "2026-11-12",
+            "requests": 1,
+            "asked": 1,
+            "quoted": 1,
+            "filled": "YES",
+            "winner": "DEALER A",
+            "check": "OK-LINKED",
+            "cohort": "INQ:FITDNA:6AF59528000002",
+            "cohort_asked": 3,
+            "otc": ""
+          },
+          {
+            "key": "INQ:FITDNA:6AF59C30000003",
+            "date": "2026-11-12",
+            "requests": 1,
+            "asked": 2,
+            "quoted": 2,
+            "filled": "NO",
+            "winner": "",
+            "check": "LINKED",
+            "cohort": "INQ:FITDNA:6AF5A0E0000004",
+            "cohort_asked": "",
+            "otc": ""
+          },
+          {
+            "key": "INQ:FITDNA:6AF5A0E0000004",
+            "date": "2026-11-12",
+            "requests": 1,
+            "asked": 1,
+            "quoted": 1,
+            "filled": "YES",
+            "winner": "DEALER C",
+            "check": "OK-LINKED",
+            "cohort": "INQ:FITDNA:6AF5A0E0000004",
+            "cohort_asked": 3,
+            "otc": ""
+          },
+          {
+            "key": "INQ:FITDNA:6AF5AA40000005",
+            "date": "2026-11-12",
+            "requests": 1,
+            "asked": 3,
+            "quoted": 2,
+            "filled": "NO",
+            "winner": "",
+            "check": "OK",
+            "cohort": "",
+            "cohort_asked": "",
+            "otc": ""
+          },
+          {
+            "key": "INQ:FITDNA:6AF5B148000006",
+            "date": "2026-11-12",
+            "requests": 1,
+            "asked": 1,
+            "quoted": 1,
+            "filled": "YES",
+            "winner": "DEALER A",
+            "check": "BREACH",
+            "cohort": "",
+            "cohort_asked": "",
+            "otc": ""
+          },
+          {
+            "key": "INQ:FITDNA:6AF5C660000007",
+            "date": "2026-11-12",
+            "requests": 1,
+            "asked": 1,
+            "quoted": 1,
+            "filled": "YES",
+            "winner": "DEALER A",
+            "check": "BREACH",
+            "cohort": "",
+            "cohort_asked": "",
+            "otc": ""
+          },
+          {
+            "key": "INQ:FITDNA:6AF5CD68000008",
+            "date": "2026-11-12",
+            "requests": 1,
+            "asked": 3,
+            "quoted": 2,
+            "filled": "NO",
+            "winner": "",
+            "check": "OK",
+            "cohort": "",
+            "cohort_asked": "",
+            "otc": ""
+          },
+          {
+            "key": "INQ:FITDNA:6AF58010000009",
+            "date": "2026-11-12",
+            "requests": 1,
+            "asked": 3,
+            "quoted": 0,
+            "filled": "NO",
+            "winner": "",
+            "check": "LINKED",
+            "cohort": "CMP:2026-11-12|XS0000000105|B|150",
+            "cohort_asked": "",
+            "otc": ""
+          },
+          {
+            "key": "CMP:2026-11-12|XS0000000105|B|150",
+            "date": "2026-11-12",
+            "requests": 1,
+            "asked": 1,
+            "quoted": 1,
+            "filled": "YES",
+            "winner": "DEALER SYND",
+            "check": "OK-LINKED",
+            "cohort": "CMP:2026-11-12|XS0000000105|B|150",
+            "cohort_asked": 4,
+            "otc": "YES"
+          },
+          {
+            "key": "INQ:FITDNA:6AF5D47000000A",
+            "date": "2026-11-12",
+            "requests": 1,
+            "asked": 3,
+            "quoted": 2,
+            "filled": "NO",
+            "winner": "",
+            "check": "OK",
+            "cohort": "",
+            "cohort_asked": "",
+            "otc": ""
+          },
+          {
+            "key": "CMP:2026-11-12|XS0000000106|B|100",
+            "date": "2026-11-12",
+            "requests": 1,
+            "asked": 1,
+            "quoted": 1,
+            "filled": "YES",
+            "winner": "DEALER A",
+            "check": "OTC-REVIEW",
+            "cohort": "",
+            "cohort_asked": "",
+            "otc": "YES"
+          }
+        ]
+      }
+    },
+    {
+      "name": "no_linking",
+      "config": {
+        "LINK_LATER_FILLS": "FALSE"
+      },
+      "expect": {
+        "n_breach": 4,
+        "n_linked": 1,
+        "units": [
+          {
+            "key": "INQ:FITDNA:6AF58E20000001",
+            "date": "2026-11-12",
+            "requests": 1,
+            "asked": 3,
+            "quoted": 2,
+            "filled": "NO",
+            "winner": "",
+            "check": "OK",
+            "cohort": "",
+            "cohort_asked": "",
+            "otc": ""
+          },
+          {
+            "key": "INQ:FITDNA:6AF59528000002",
+            "date": "2026-11-12",
+            "requests": 1,
+            "asked": 1,
+            "quoted": 1,
+            "filled": "YES",
+            "winner": "DEALER A",
+            "check": "BREACH",
+            "cohort": "",
+            "cohort_asked": "",
+            "otc": ""
+          },
+          {
+            "key": "INQ:FITDNA:6AF59C30000003",
+            "date": "2026-11-12",
+            "requests": 1,
+            "asked": 2,
+            "quoted": 2,
+            "filled": "NO",
+            "winner": "",
+            "check": "LOW",
+            "cohort": "",
+            "cohort_asked": "",
+            "otc": ""
+          },
+          {
+            "key": "INQ:FITDNA:6AF5A0E0000004",
+            "date": "2026-11-12",
+            "requests": 1,
+            "asked": 1,
+            "quoted": 1,
+            "filled": "YES",
+            "winner": "DEALER C",
+            "check": "BREACH",
+            "cohort": "",
+            "cohort_asked": "",
+            "otc": ""
+          },
+          {
+            "key": "INQ:FITDNA:6AF5AA40000005",
+            "date": "2026-11-12",
+            "requests": 1,
+            "asked": 3,
+            "quoted": 2,
+            "filled": "NO",
+            "winner": "",
+            "check": "OK",
+            "cohort": "",
+            "cohort_asked": "",
+            "otc": ""
+          },
+          {
+            "key": "INQ:FITDNA:6AF5B148000006",
+            "date": "2026-11-12",
+            "requests": 1,
+            "asked": 1,
+            "quoted": 1,
+            "filled": "YES",
+            "winner": "DEALER A",
+            "check": "BREACH",
+            "cohort": "",
+            "cohort_asked": "",
+            "otc": ""
+          },
+          {
+            "key": "INQ:FITDNA:6AF5C660000007",
+            "date": "2026-11-12",
+            "requests": 1,
+            "asked": 1,
+            "quoted": 1,
+            "filled": "YES",
+            "winner": "DEALER A",
+            "check": "BREACH",
+            "cohort": "",
+            "cohort_asked": "",
+            "otc": ""
+          },
+          {
+            "key": "INQ:FITDNA:6AF5CD68000008",
+            "date": "2026-11-12",
+            "requests": 1,
+            "asked": 3,
+            "quoted": 2,
+            "filled": "NO",
+            "winner": "",
+            "check": "OK",
+            "cohort": "",
+            "cohort_asked": "",
+            "otc": ""
+          },
+          {
+            "key": "INQ:FITDNA:6AF58010000009",
+            "date": "2026-11-12",
+            "requests": 1,
+            "asked": 3,
+            "quoted": 0,
+            "filled": "NO",
+            "winner": "",
+            "check": "LINKED",
+            "cohort": "CMP:2026-11-12|XS0000000105|B|150",
+            "cohort_asked": "",
+            "otc": ""
+          },
+          {
+            "key": "CMP:2026-11-12|XS0000000105|B|150",
+            "date": "2026-11-12",
+            "requests": 1,
+            "asked": 1,
+            "quoted": 1,
+            "filled": "YES",
+            "winner": "DEALER SYND",
+            "check": "OK-LINKED",
+            "cohort": "CMP:2026-11-12|XS0000000105|B|150",
+            "cohort_asked": 4,
+            "otc": "YES"
+          },
+          {
+            "key": "INQ:FITDNA:6AF5D47000000A",
+            "date": "2026-11-12",
+            "requests": 1,
+            "asked": 3,
+            "quoted": 2,
+            "filled": "NO",
+            "winner": "",
+            "check": "OK",
+            "cohort": "",
+            "cohort_asked": "",
+            "otc": ""
+          },
+          {
+            "key": "CMP:2026-11-12|XS0000000106|B|100",
+            "date": "2026-11-12",
+            "requests": 1,
+            "asked": 1,
+            "quoted": 1,
+            "filled": "YES",
+            "winner": "DEALER A",
+            "check": "OTC-REVIEW",
+            "cohort": "",
+            "cohort_asked": "",
+            "otc": "YES"
+          }
+        ]
+      }
+    },
+    {
+      "name": "nobody_excluded",
+      "config": {
+        "EXCLUDE_USERS": ""
+      },
+      "expect": {
+        "n_units": 13,
+        "n_excluded": 0,
+        "n_breach": 3
+      }
+    }
+  ]
+}
